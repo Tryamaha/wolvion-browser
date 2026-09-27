@@ -1,0 +1,156 @@
+name: CI
+
+# GitHub Actions is BrownBear's recommended/primary build environment (free macOS runners).
+# This pipeline lints, validates commit hygiene + the injected JS, and BUILDS & TESTS the app
+# by generating the Xcode project from project.yml with XcodeGen. See docs/BUILDING.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # A PR's runs supersede each other (a fresh push cancels the last, sparing the macOS runner pool), but
+  # every push to main gets a UNIQUE per-commit group that is NEVER cancelled. Previously the group was
+  # keyed only on `github.ref`, which is `refs/heads/main` for ALL main pushes — so merging two PRs close
+  # together made the second merge's run cancel the first merge's still-running main CI, leaving merged
+  # commits with a cancelled (never-completed) run on main. Now: PRs key on the PR number (supersede on),
+  # pushes key on the commit SHA (supersede off), so each merge keeps its own complete main CI run.
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: SwiftLint
+    # Runs on Linux instead of a macOS runner: SwiftLint doesn't need macOS, and keeping it off the
+    # scarce macOS pool lets the gating "Build & Test" claim a runner immediately. We fetch
+    # SwiftLint's official prebuilt Linux binary (a small unzip) rather than the norio-nomura Docker
+    # action, whose per-run `docker build` step is slow and flakes intermittently with "Docker build
+    # failed" while assembling its base image — which was red-flagging otherwise-green PRs.
+    runs-on: ubuntu-latest
+    env:
+      SWIFTLINT_VERSION: "0.63.3"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install SwiftLint (official Linux binary)
+        run: |
+          set -euo pipefail
+          # --retry rides out the intermittent 50x the GitHub release CDN returns for this asset, which
+          # was failing the lint job on otherwise-green PRs.
+          curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors -o swiftlint.zip \
+            "https://github.com/realm/SwiftLint/releases/download/${SWIFTLINT_VERSION}/swiftlint_linux_amd64.zip"
+          unzip -q -o swiftlint.zip -d "${RUNNER_TEMP}/swiftlint"
+          chmod +x "${RUNNER_TEMP}/swiftlint/swiftlint"
+          echo "${RUNNER_TEMP}/swiftlint" >> "${GITHUB_PATH}"
+      - name: Run SwiftLint
+        run: swiftlint lint --config .swiftlint.yml --reporter github-actions-logging
+
+  commitlint:
+    name: Conventional Commits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Validate PR commit messages
+        if: github.event_name == 'pull_request'
+        run: |
+          range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          pattern='^(feat|fix|refactor|perf|docs|test|build|ci|chore|revert)(\([a-z0-9-]+\))?!?: .{1,72}'
+          fail=0
+          # --no-merges: a merge commit subject ("Merge branch 'main' into …") is not a conventional
+          # commit and is never what ships (PRs squash-merge), but it appears in the range whenever a PR
+          # branch is brought up to date via GitHub's "Update branch" button. Skipping merges keeps that
+          # routine action from red-flagging an otherwise-clean PR.
+          while IFS= read -r subject; do
+            [ -z "$subject" ] && continue
+            if ! printf '%s' "$subject" | grep -Eq "$pattern"; then
+              echo "::error::Non-conventional commit subject: '$subject'"
+              fail=1
+            fi
+          done < <(git log --no-merges --format=%s "$range")
+          exit $fail
+
+  js-runtime:
+    name: Validate injected JS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+      - name: Syntax-check JS runtime files
+        run: |
+          shopt -s nullglob
+          files=(BrownBear/Resources/JS/*.js)
+          if [ ${#files[@]} -eq 0 ]; then echo "No JS runtime files yet — skipping."; exit 0; fi
+          for f in "${files[@]}"; do echo "Checking $f"; node --check "$f"; done
+      - name: Run JS runtime functional tests
+        run: |
+          shopt -s nullglob
+          tests=(Tests/JS/*.test.js)
+          if [ ${#tests[@]} -eq 0 ]; then echo "No JS functional tests — skipping."; exit 0; fi
+          for t in "${tests[@]}"; do echo "Running $t"; node "$t"; done
+
+  build:
+    name: Build & Test (iOS Simulator)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup iOS build (Xcode + XcodeGen + SPM cache)
+        uses: ./.github/actions/setup-ios-build
+      # DerivedData is NOT cached/reused across commits — reusing it shipped stale binaries (Xcode
+      # skipped recompiling changed files). A clean build every run guarantees the tests see the latest
+      # code; only the SwiftPM package cache (safe) is reused.
+      - name: Pick and pre-boot an iOS simulator
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(dev['udid'] for k,v in d['devices'].items() if 'iOS' in k for dev in v if dev.get('isAvailable')))")
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          echo "Using simulator $UDID"
+          # Boot it now so it finishes warming WHILE the app compiles — taking the ~30-60s simulator
+          # boot off the test step's critical path (xcodebuild test reuses the already-booted device).
+          xcrun simctl boot "$UDID" 2>/dev/null || true
+      - name: Build & test
+        # Flags that trim minutes without changing what's built or tested:
+        #   ONLY_ACTIVE_ARCH=YES               — compile just the simulator's arch, not both
+        #   -disableAutomaticPackageResolution — packages are resolved in setup; don't re-resolve
+        #   -skip*Validation                   — skip the interactive plugin/macro trust checks (CI)
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project BrownBear.xcodeproj \
+            -scheme BrownBear \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -clonedSourcePackagesDirPath .spm-cache \
+            -derivedDataPath .derived-data \
+            -resultBundlePath TestResults.xcresult \
+            -quiet \
+            -disableAutomaticPackageResolution \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            ONLY_ACTIVE_ARCH=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Dump BrownBear crash report on failure
+        if: failure()
+        run: |
+          echo "=== BrownBear crash reports (host DiagnosticReports) ==="
+          found=$(grep -rl "BrownBear" ~/Library/Logs/DiagnosticReports/ 2>/dev/null | grep -iE '\.ips$' || true)
+          for f in $found; do echo "----- $f -----"; head -c 7000 "$f"; echo; echo; done
+          echo "=== BrownBear crash reports (simulator devices) ==="
+          for f in $(find ~/Library/Developer/CoreSimulator/Devices -name '*.ips' 2>/dev/null | xargs grep -l "BrownBear" 2>/dev/null); do
+            echo "----- $f -----"; head -c 7000 "$f"; echo; echo; done
+          if [ -z "$found" ]; then echo "(no BrownBear .ips in host reports; listing recent reports)"; ls -lt ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -8; fi
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: TestResults
+          path: TestResults.xcresult
+          if-no-files-found: ignore
