@@ -127,7 +127,7 @@ extension BrownBearBrowserViewController {
         <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
         <style>\(newTabCSS)</style></head><body>
           <div class="wrap">
-            <div class="brand fade"><span class="mark">\(brandMark)</span><h1>BrownBear</h1></div>
+            <div class="brand fade"><span class="mark">\(brandMark)</span><h1>Wolvion Browser</h1></div>
             <div class="sbox fade" style="animation-delay:.04s">
               <form class="search" action="\(engine.formAction)" method="GET" autocomplete="off">
                 <img class="elogo" src="https://\(engineHost)/favicon.ico" alt="" onerror="this.style.visibility='hidden'">
@@ -167,9 +167,8 @@ extension BrownBearBrowserViewController {
       .tile,.row,form.search,.sgrow{transition:none;}}
     .brand{display:flex;align-items:center;gap:11px;justify-content:center;margin-bottom:28px;}
     .brand .mark{width:32px;height:32px;border-radius:10px;display:grid;place-items:center;
-      background:linear-gradient(160deg,var(--g1),var(--g2));
       box-shadow:inset 0 .5px 0 rgba(255,255,255,.25),0 4px 12px var(--s2);}
-    .brand .mark svg{width:22px;height:22px;display:block;}
+    .brand .mark img{width:32px;height:32px;border-radius:10px;display:block;}
     .brand h1{font-size:20px;font-weight:700;margin:0;letter-spacing:-.3px;}
     .sbox{position:relative;margin-bottom:34px;z-index:5;}
     form.search{display:flex;align-items:center;gap:11px;background:var(--glass);
@@ -303,9 +302,11 @@ extension BrownBearBrowserViewController {
     private static let glyphPuzzle = ##"<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.9" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/></svg>"##
     private static let glyphTheme = ##"<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.9"><circle cx="12" cy="12" r="9"/><path fill="#fff" stroke="none" d="M12 3a9 9 0 010 18z"/></svg>"##
     private static let glyphGithub = ##"<svg viewBox="0 0 24 24" fill="#fff"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.88-.01-1.73-2.78.62-3.37-1.37-3.37-1.37-.46-1.18-1.11-1.5-1.11-1.5-.91-.64.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.36-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.27 2.75 1.05A9.4 9.4 0 0112 6.84c.85 0 1.71.12 2.51.34 1.91-1.32 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.34 4.79-4.57 5.05.36.32.68.94.68 1.9 0 1.37-.01 2.47-.01 2.81 0 .27.18.59.69.49A10.26 10.26 0 0022 12.25C22 6.58 17.52 2 12 2z"/></svg>"##
-    /// The BrownBear mark: a clean bear face (white head + ears, graphite eyes + nose) drawn inside the
-    /// brand chip — the actual logo, replacing the bare "B" letter.
-    private static let brandMark = ##"<svg viewBox="0 0 24 24"><g fill="#fff"><circle cx="6.7" cy="7.4" r="3"/><circle cx="17.3" cy="7.4" r="3"/><circle cx="12" cy="13.6" r="7.4"/></g><g fill="#2a2a2c"><circle cx="9.5" cy="12.4" r="1.05"/><circle cx="14.5" cy="12.4" r="1.05"/><circle cx="12" cy="15.5" r="1.4"/></g></svg>"##
+    /// Embed the bundled Wolvion artwork so the local New Tab page needs no external image request.
+    private static var brandMark: String {
+        guard let data = UIImage(named: "WolvionMark")?.pngData() else { return "W" }
+        return "<img src=\"data:image/png;base64,\(data.base64EncodedString())\" alt=\"\">"
+    }
     // swiftlint:enable line_length
 
     /// The onboarding guide shown on a fresh New Tab page (no bookmarks/history yet). Static, first-party.
@@ -338,11 +339,11 @@ extension BrownBearBrowserViewController {
           <p class="d">Light, Dark, or the classic OG BrownBear theme, in Settings &rsaquo; Appearance.</p>
         </span>
       </div>
-      <a class="row fade" style="animation-delay:.32s" href="https://github.com/DudeAint/brownbear">
+      <a class="row fade" style="animation-delay:.32s" href="https://github.com/Tryamaha/wolvion-browser">
         <span class="g">\(glyphGithub)</span>
         <span class="body">
           <p class="t">Open on GitHub</p>
-          <p class="d">BrownBear is built in the open. Follow along, file issues, or star the project.</p>
+          <p class="d">Wolvion Browser is built in the open. Follow along or report an issue.</p>
         </span>
         <span class="chev"></span>
       </a>
@@ -351,11 +352,11 @@ extension BrownBearBrowserViewController {
 
     /// A slim footer (returning users) keeping GitHub one tap away below their tiles.
     private static let newTabFooterHTML = """
-    <a class="row fade" style="animation-delay:.3s" href="https://github.com/DudeAint/brownbear">
+    <a class="row fade" style="animation-delay:.3s" href="https://github.com/Tryamaha/wolvion-browser">
       <span class="g">\(glyphGithub)</span>
       <span class="body">
         <p class="t">Open on GitHub</p>
-        <p class="d">BrownBear is built in the open. Follow along, file issues, or star the project.</p>
+        <p class="d">Wolvion Browser is built in the open. Follow along or report an issue.</p>
       </span>
       <span class="chev"></span>
     </a>
@@ -369,7 +370,7 @@ extension BrownBearBrowserViewController {
     /// traded for a compact, non-intrusive accent button.
     private static var newTabIssueCTA: String {
         let body = """
-        Thanks for helping make BrownBear run every extension — a few details get this fixed fast:
+        Thanks for helping improve Wolvion Browser's extension support — a few details help us investigate:
 
         **Which extension?** (its name + where you got it — Chrome Web Store, Edge, Firefox…)
 
@@ -384,14 +385,14 @@ extension BrownBearBrowserViewController {
 
 
         """
-        var components = URLComponents(string: "https://github.com/DudeAint/brownbear/issues/new")
+        var components = URLComponents(string: "https://github.com/Tryamaha/wolvion-browser/issues/new")
         components?.queryItems = [
             URLQueryItem(name: "labels", value: "extension,bug"),
             URLQueryItem(name: "title", value: "Extension not working: "),
             URLQueryItem(name: "body", value: body)
         ]
         let href = htmlEscape(components?.url?.absoluteString
-            ?? "https://github.com/DudeAint/brownbear/issues/new")
+            ?? "https://github.com/Tryamaha/wolvion-browser/issues/new")
         return """
         <p class="cta fade" style="animation-delay:.36s"><a href="\(href)">\(glyphGithub)Extension not working? Report it</a></p>
         """

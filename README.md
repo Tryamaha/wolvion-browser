@@ -4,7 +4,7 @@
 
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/DudeAint/brownbear/main/docs/assets/banner.png" alt="BrownBear — Userscripts & Power Browser for iOS" width="100%" />
+<img src="BrownBear/Resources/Assets.xcassets/AppIcon.appiconset/icon-light.png" alt="Wolvion Browser cat icon on a yellow background" width="180" />
 
 <br/>
 
