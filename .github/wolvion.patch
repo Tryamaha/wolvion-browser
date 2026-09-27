@@ -1,0 +1,420 @@
+diff --git a/BrownBear/Browser/BrownBearBrowserViewController+ExtensionInstall.swift b/BrownBear/Browser/BrownBearBrowserViewController+ExtensionInstall.swift
+index 7faca9b..222a53d 100644
+--- a/BrownBear/Browser/BrownBearBrowserViewController+ExtensionInstall.swift
++++ b/BrownBear/Browser/BrownBearBrowserViewController+ExtensionInstall.swift
+@@ -222,10 +222,16 @@ extension BrownBearBrowserViewController {
+         Task { @MainActor in
+             do {
+                 let data = try await source.downloadArchive()
+-                _ = try await BrownBearServices.shared.webExtensionStore.install(archive: data, storeID: source.storeID)
++                _ = try await BrownBearServices.shared.webExtensionStore.install(
++                    archive: data, storeID: source.storeID, authorize: { manifest in
++                        await WebExtensionInstallPrompt.request(manifest: manifest)
++                    })
+                 NotificationCenter.default.post(name: .brownBearExtensionsDidChange, object: nil)
+                 presentExtensionToast(message: "Added “\(name)” to BrownBear")
+                 refreshExtensionInstallBanner()   // flip the pill to the "Remove" state
++            } catch BrownBearError.extensionInstallDeclined {
++                button.isEnabled = true
++                button.configuration?.showsActivityIndicator = false
+             } catch {
+                 button.isEnabled = true
+                 button.configuration?.showsActivityIndicator = false
+diff --git a/BrownBear/Dashboard/ExtensionsView.swift b/BrownBear/Dashboard/ExtensionsView.swift
+index d7d8c79..808f173 100644
+--- a/BrownBear/Dashboard/ExtensionsView.swift
++++ b/BrownBear/Dashboard/ExtensionsView.swift
+@@ -22,9 +22,13 @@ final class ExtensionsViewModel: ObservableObject {
+ 
+     func install(data: Data) async {
+         do {
+-            _ = try await store.install(archive: data)
++            _ = try await store.install(archive: data, authorize: { manifest in
++                await WebExtensionInstallPrompt.request(manifest: manifest)
++            })
+             await load()
+             notifyChanged()
++        } catch BrownBearError.extensionInstallDeclined {
++            return
+         } catch {
+             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+         }
+@@ -43,9 +47,14 @@ final class ExtensionsViewModel: ObservableObject {
+                 return
+             }
+             let data = try await source.downloadArchive()
+-            _ = try await store.install(archive: data, storeID: source.storeID)
++            _ = try await store.install(archive: data, storeID: source.storeID,
++                                        authorize: { manifest in
++                                            await WebExtensionInstallPrompt.request(manifest: manifest)
++                                        })
+             await load()
+             notifyChanged()
++        } catch BrownBearError.extensionInstallDeclined {
++            return
+         } catch {
+             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+         }
+diff --git a/BrownBear/Extensions/WebExtensionInstallPrompt.swift b/BrownBear/Extensions/WebExtensionInstallPrompt.swift
+new file mode 100644
+index 0000000..db13519
+--- /dev/null
++++ b/BrownBear/Extensions/WebExtensionInstallPrompt.swift
+@@ -0,0 +1,60 @@
++//
++//  WebExtensionInstallPrompt.swift
++//  BrownBear
++//
++//  Reviews the actual downloaded extension package before it can be written to disk. The store
++//  requires this decision for every install entry point; optional permissions are shown here for
++//  awareness and still require their own consent when requested at runtime.
++//
++
++import UIKit
++
++enum WebExtensionInstallPrompt {
++
++    @MainActor
++    static func request(manifest: WebExtensionManifest) async -> Bool {
++        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
++            let scene = UIApplication.shared.connectedScenes
++                .compactMap { $0 as? UIWindowScene }
++                .first { $0.activationState == .foregroundActive }
++            guard let window = scene?.windows.first(where: \.isKeyWindow),
++                  window.rootViewController != nil else {
++                continuation.resume(returning: false)
++                return
++            }
++
++            let alert = UIAlertController(title: "Install \(manifest.name)?",
++                                          message: reviewText(for: manifest),
++                                          preferredStyle: .alert)
++            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
++                continuation.resume(returning: false)
++            })
++            alert.addAction(UIAlertAction(title: "Install", style: .default) { _ in
++                continuation.resume(returning: true)
++            })
++            TopViewControllerPresenter.present(alert)
++        }
++    }
++
++    /// Lists required access separately from access the extension can ask for later. A content
++    /// script's matches also matter: it can run code on matching pages without a host grant.
++    static func reviewText(for manifest: WebExtensionManifest) -> String {
++        var lines = ["Version \(manifest.version) · Manifest V\(manifest.manifestVersion)"]
++        lines.append(section("Required APIs", values: manifest.permissions))
++        lines.append(section("Required site access", values: manifest.hostPermissions))
++        let scriptSites = manifest.contentScripts.flatMap(\.matches)
++        lines.append(section("Sites where scripts run", values: scriptSites))
++        lines.append(section("May request APIs later", values: manifest.optionalPermissions))
++        lines.append(section("May request sites later", values: manifest.optionalHostPermissions))
++        lines.append("Only install extensions you trust. This review does not verify the extension's code or safety.")
++        return lines.joined(separator: "\n\n")
++    }
++
++    private static func section(_ title: String, values: [String]) -> String {
++        let unique = Array(Set(values)).sorted()
++        guard !unique.isEmpty else { return "\(title): none" }
++        let shown = unique.prefix(12).joined(separator: ", ")
++        let remainder = unique.count > 12 ? " (+\(unique.count - 12) more)" : ""
++        return "\(title): \(shown)\(remainder)"
++    }
++}
+diff --git a/BrownBear/Extensions/WebExtensionStore.swift b/BrownBear/Extensions/WebExtensionStore.swift
+index 729866a..b64e9be 100644
+--- a/BrownBear/Extensions/WebExtensionStore.swift
++++ b/BrownBear/Extensions/WebExtensionStore.swift
+@@ -95,14 +95,18 @@ actor WebExtensionStore {
+     /// Chrome Web Store id it came from (when installed via the store), recorded so the in-page store
+     /// button can detect "already added"; pass `nil` for a sideloaded archive.
+     @discardableResult
+-    func install(archive: Data, storeID: String? = nil) async throws -> WebExtension {
++    func install(archive: Data, storeID: String? = nil,
++                 authorize: @Sendable (WebExtensionManifest) async -> Bool) async throws -> WebExtension {
+         loadIfNeeded()
+         let files = try WebExtensionArchive.unpack(archive)
+         guard let manifestData = files["manifest.json"] else {
+             throw BrownBearError.metadataParseFailed("the package has no manifest.json")
+         }
+         // Validate the manifest before committing anything to disk.
+-        _ = try WebExtensionManifest.parse(manifestData)
++        let manifest = try WebExtensionManifest.parse(manifestData)
++        // Consent is required for every install path, including re-installs. No disk or index mutation
++        // happens until the user has reviewed the manifest of the actual archive being installed.
++        guard await authorize(manifest) else { throw BrownBearError.extensionInstallDeclined }
+         let manifestJSON = String(decoding: manifestData, as: UTF8.self)
+ 
+         // Re-installing from the same store page replaces the prior copy rather than duplicating it.
+diff --git a/BrownBear/Extensions/WebStoreInstallHandler.swift b/BrownBear/Extensions/WebStoreInstallHandler.swift
+index a907bf1..a5b257a 100644
+--- a/BrownBear/Extensions/WebStoreInstallHandler.swift
++++ b/BrownBear/Extensions/WebStoreInstallHandler.swift
+@@ -65,9 +65,14 @@ final class WebStoreInstallHandler: NSObject, WKScriptMessageHandlerWithReply {
+             case "install":
+                 do {
+                     let data = try await source.downloadArchive()
+-                    let ext = try await store.install(archive: data, storeID: storeID)
++                    let ext = try await store.install(archive: data, storeID: storeID,
++                                                      authorize: { manifest in
++                                                          await WebExtensionInstallPrompt.request(manifest: manifest)
++                                                      })
+                     NotificationCenter.default.post(name: .brownBearExtensionsDidChange, object: nil)
+                     replyHandler(["installed": true, "name": ext.displayName], nil)
++                } catch BrownBearError.extensionInstallDeclined {
++                    replyHandler(["installed": false, "name": ""], nil)
+                 } catch {
+                     let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                     replyHandler(nil, message)
+diff --git a/BrownBear/Models/BrownBearError.swift b/BrownBear/Models/BrownBearError.swift
+index beed891..a06e04d 100644
+--- a/BrownBear/Models/BrownBearError.swift
++++ b/BrownBear/Models/BrownBearError.swift
+@@ -20,6 +20,8 @@ enum BrownBearError: LocalizedError, Equatable {
+     case metadataParseFailed(String)
+     /// A GM bridge request was malformed or violated a script's grants/connect allowlist.
+     case bridgeRejected(String)
++    /// The user declined an extension package after reviewing its declared access.
++    case extensionInstallDeclined
+ 
+     var errorDescription: String? {
+         switch self {
+@@ -33,6 +35,8 @@ enum BrownBearError: LocalizedError, Equatable {
+             return "Couldn’t read the userscript: \(reason)"
+         case .bridgeRejected(let reason):
+             return "Script request rejected: \(reason)"
++        case .extensionInstallDeclined:
++            return "Extension installation was cancelled."
+         }
+     }
+ }
+diff --git a/BrownBearTests/WebExtensionTests.swift b/BrownBearTests/WebExtensionTests.swift
+index 7f40f04..c08a262 100644
+--- a/BrownBearTests/WebExtensionTests.swift
++++ b/BrownBearTests/WebExtensionTests.swift
+@@ -296,7 +296,7 @@ final class WebExtensionStoreTests: XCTestCase {
+         ])
+ 
+         let store = WebExtensionStore(baseDirectory: baseDir)
+-        let installed = try await store.install(archive: archive)
++        let installed = try await store.install(archive: archive, authorize: { _ in true })
+         XCTAssertEqual(installed.manifest?.name, "Installer")
+         XCTAssertEqual(installed.id.count, 32)
+ 
+@@ -340,7 +340,7 @@ final class WebExtensionStoreTests: XCTestCase {
+         let archive = TestZip.make([(name: "readme.txt", data: Data("hi".utf8))])
+         let store = WebExtensionStore(baseDirectory: baseDir)
+         do {
+-            _ = try await store.install(archive: archive)
++            _ = try await store.install(archive: archive, authorize: { _ in true })
+             XCTFail("should reject an archive with no manifest.json")
+         } catch {
+             // expected
+diff --git a/BrownBearTests/WebStoreInstallTests.swift b/BrownBearTests/WebStoreInstallTests.swift
+index b90a7a1..8f592a8 100644
+--- a/BrownBearTests/WebStoreInstallTests.swift
++++ b/BrownBearTests/WebStoreInstallTests.swift
+@@ -32,7 +32,8 @@ final class WebStoreInstallTests: XCTestCase {
+         let (store, dir) = tempStore()
+         defer { try? FileManager.default.removeItem(at: dir) }
+ 
+-        let installed = try await store.install(archive: archive(name: "Blocker"), storeID: storeID)
++        let installed = try await store.install(archive: archive(name: "Blocker"), storeID: storeID,
++                                                authorize: { _ in true })
+         XCTAssertEqual(installed.storeID, storeID)
+         XCTAssertNotEqual(installed.id, storeID, "the local id is generated, not the store id")
+ 
+@@ -46,7 +47,7 @@ final class WebStoreInstallTests: XCTestCase {
+         let (store, dir) = tempStore()
+         defer { try? FileManager.default.removeItem(at: dir) }
+ 
+-        let installed = try await store.install(archive: archive(name: "Sideload"))
++        let installed = try await store.install(archive: archive(name: "Sideload"), authorize: { _ in true })
+         XCTAssertNil(installed.storeID)
+         let found = await store.installed(forStoreID: storeID)
+         XCTAssertNil(found)
+@@ -56,8 +57,10 @@ final class WebStoreInstallTests: XCTestCase {
+         let (store, dir) = tempStore()
+         defer { try? FileManager.default.removeItem(at: dir) }
+ 
+-        let first = try await store.install(archive: archive(name: "V1"), storeID: storeID)
+-        let second = try await store.install(archive: archive(name: "V2"), storeID: storeID)
++        let first = try await store.install(archive: archive(name: "V1"), storeID: storeID,
++                                            authorize: { _ in true })
++        let second = try await store.install(archive: archive(name: "V2"), storeID: storeID,
++                                             authorize: { _ in true })
+ 
+         let all = await store.all()
+         XCTAssertEqual(all.count, 1, "re-installing the same store id replaces, never duplicates")
+@@ -71,7 +74,8 @@ final class WebStoreInstallTests: XCTestCase {
+         let (store, dir) = tempStore()
+         defer { try? FileManager.default.removeItem(at: dir) }
+ 
+-        _ = try await store.install(archive: archive(name: "Persisted"), storeID: storeID)
++        _ = try await store.install(archive: archive(name: "Persisted"), storeID: storeID,
++                                    authorize: { _ in true })
+         let reopened = WebExtensionStore(baseDirectory: dir)
+         let found = await reopened.installed(forStoreID: storeID)
+         XCTAssertEqual(found?.displayName, "Persisted")
+@@ -85,4 +89,39 @@ final class WebStoreInstallTests: XCTestCase {
+         let decoded = try JSONDecoder().decode(WebExtension.self, from: data)
+         XCTAssertEqual(decoded.storeID, storeID)
+     }
++
++    func testDecliningReinstallPreservesInstalledExtension() async throws {
++        let (store, dir) = tempStore()
++        defer { try? FileManager.default.removeItem(at: dir) }
++        let original = try await store.install(archive: archive(name: "Original"), storeID: storeID,
++                                               authorize: { _ in true })
++
++        do {
++            _ = try await store.install(archive: archive(name: "Replacement"), storeID: storeID,
++                                        authorize: { manifest in
++                                            XCTAssertEqual(manifest.name, "Replacement")
++                                            return false
++                                        })
++            XCTFail("declined extension must not be installed")
++        } catch BrownBearError.extensionInstallDeclined {
++            let retained = await store.installed(forStoreID: storeID)
++            XCTAssertEqual(retained?.id, original.id)
++            XCTAssertEqual(retained?.displayName, "Original")
++        }
++    }
++
++    func testReviewShowsRequiredOptionalAndScriptSiteAccess() throws {
++        let manifest = try WebExtensionManifest.parse([
++            "manifest_version": 3, "name": "Conso", "version": "0.1.4",
++            "permissions": ["identity", "scripting", "storage"],
++            "host_permissions": ["https://conso.xyz/*"],
++            "optional_host_permissions": ["https://chatgpt.com/*"],
++            "content_scripts": [["matches": ["https://example.com/*"], "js": ["content.js"]]]
++        ])
++        let review = WebExtensionInstallPrompt.reviewText(for: manifest)
++        XCTAssertTrue(review.contains("identity, scripting, storage"))
++        XCTAssertTrue(review.contains("Required site access: https://conso.xyz/*"))
++        XCTAssertTrue(review.contains("May request sites later: https://chatgpt.com/*"))
++        XCTAssertTrue(review.contains("Sites where scripts run: https://example.com/*"))
++    }
+ }
+diff --git a/README.md b/README.md
+index dc13dde..2c9cb17 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,7 @@
++> **Wolvion Browser iOS adaptation:** The iPhone app display name is Wolvion Browser. This
++> repository retains BrownBear's source and MIT license, and adds a required permission review
++> before extension installs. See [Türkçe kurulum ve proje durumu](WOLVION_README_TR.md).
++
+ <div align="center">
+ 
+ <img src="https://raw.githubusercontent.com/DudeAint/brownbear/main/docs/assets/banner.png" alt="BrownBear — Userscripts & Power Browser for iOS" width="100%" />
+diff --git a/WOLVION_README_TR.md b/WOLVION_README_TR.md
+new file mode 100644
+index 0000000..ec75bd2
+--- /dev/null
++++ b/WOLVION_README_TR.md
+@@ -0,0 +1,66 @@
++# Wolvion Browser — iPhone kaynak kodu
++
++Bu çalışma [BrownBear](https://github.com/DudeAint/brownbear) açık kaynak projesinin
++27 Eylül 2026 tarihinde alınmış MIT lisanslı bir kopyasıdır. Özgün lisans ve proje adı kaynak
++dosyalarında korunmuştur. iPhone ana ekranında görünen ad **Wolvion Browser** olarak ayarlanmıştır.
++
++## Bu kopyada yapılan değişiklik
++
++- Chrome, Edge, Firefox mağazası, bağlantı, öneriler ve yerel CRX/ZIP yüklemeleri, aynı zorunlu
++  onay kapısından geçer.
++- İndirilen paketin `manifest.json` dosyasındaki gerekli API izinleri, site erişimi,
++  sayfada çalışacak betiklerin eşleşmeleri ve sonradan istenebilen izinler kurulmadan önce görünür.
++- Kullanıcı iptal ederse uzantı yüklenmez. Yeniden yükleme iptal edilirse eskisi korunur.
++- Mevcut BrownBear site korumaları ve uzantı motoru yerinde kalır. Kurulum ekranı kötü amaçlı kod
++  taraması ya da uzantının güvenilirliğine ilişkin garanti değildir.
++
++## Durum
++
++Kaynak kodu hazırdır; bu ortam Linux olduğu için iOS uygulaması derlenmedi veya iPhone üzerinde
++çalıştırılmadı. Bir IPA ya da TestFlight dağıtımı değildir. Tüm Chrome uzantıları veya tüm
++güvenlik uzantılarıyla uyumluluk iddia edilmez. BrownBear, Apple WebKit üzerinde kendi uyumluluk
++katmanını kullanır; bazı Chrome API'leri eksik veya farklı davranabilir.
++
++## Mac ile çalıştırma
++
++1. Xcode 15 veya üzerini ve XcodeGen'i kurun (`brew install xcodegen`).
++2. Bu klasörde `xcodegen generate` komutunu çalıştırın.
++3. `BrownBear.xcodeproj` dosyasını Xcode ile açın; **BrownBear** şemasını ve iPhone'unuzu seçin.
++4. Signing & Capabilities bölümünde kendi Apple geliştirme takımınızı seçin. `com.wolvion.browser`
++   tanımlayıcısı hesabınızda kullanımdaysa `project.yml` içindeki `PRODUCT_BUNDLE_IDENTIFIER`
++   değerini değiştirip yeniden `xcodegen generate` çalıştırın.
++5. Önce bir iOS simülatöründe derleyin ve testleri çalıştırın; ardından cihazda deneyin.
++
++Kaynak projenin ayrıntılı derleme yönergeleri: `docs/BUILDING.md`. Üçüncü taraf bağımlılıklar
++Xcode tarafından indirilecektir. TestFlight yayını için ayrıca Apple geliştirici hesabı,
++imzalama ve App Store Connect kurulumu gerekir.
++
++## GitHub bağlantısı ve iPhone ana ekranı
++
++GitHub bağlantısı projenin kodunu açar. Safari'de **Ana Ekrana Ekle** ile bu bağlantının
++kısayolunu oluşturmak, iOS tarayıcı uygulamasını kurmaz; Chrome uzantıları bu kısayolda
++çalışmaz. Gerçek tarayıcı simgesinin ana ekranda görünmesi için uygulama Xcode'da derlenip
++bir Apple hesabıyla imzalanarak iPhone'a yüklenmelidir. Geliştirici hesabıyla TestFlight
++dağıtımı da hazırlanabilir.
++
++Depodaki `.github/workflows/ci.yml` GitHub üzerinde iOS simülatörü derlemesi ve testleri
++çalıştırır; CI çıktısı imzalı iPhone yükleme paketi değildir. Kaynak kodu GitHub'a aktarılınca
++önce bu testlerin sonucuna bakmak gerekir.
++
++## Conso AI Usage Tracker bulguları
++
++Paylaştığınız 0.1.4 CRX paketinin manifestinde `storage`, `identity`, `scripting` izinleri;
++`conso.xyz` alanlarına zorunlu erişim ve ChatGPT, Claude, Gemini, Perplexity alanlarına
++isteğe bağlı erişim var. Paket Google girişi sırasında `identity.getRedirectURL` ve
++`identity.launchWebAuthFlow` kullanıyor. BrownBear'ın kodunda bu API'ler var, ancak iPhone'da
++bu CRX'in açılması, veri toplaması veya giriş yapması test edilmedi.
++
++Önemli uyumluluk riski: BrownBear mağazadan yüklenen eklentiye yeni bir yerel uzantı kimliği
++veriyor. Conso'nun Google OAuth istemcisi özgün Chrome uzantısı kimliğiyle ilişkili bir yönlendirme
++adresi bekliyorsa Google girişi başarısız olabilir. Bunu doğrulamak için gerçek cihaz testi ve
++gerekirse uzantı geliştiricisiyle kimlik/yönlendirme desteği gerekir.
++
++## Kaynak ve lisans
++
++BrownBear, MIT lisansı altındadır. Lisansın tam metni `LICENSE` dosyasında; kaynak proje
++teşekkürleri ve üçüncü taraf bildirimleri `THIRD_PARTY_NOTICES.md` dosyasındadır.
+diff --git a/docs/WEB_EXTENSIONS.md b/docs/WEB_EXTENSIONS.md
+index 5c8f93a..db010a1 100644
+--- a/docs/WEB_EXTENSIONS.md
++++ b/docs/WEB_EXTENSIONS.md
+@@ -2,6 +2,11 @@
+ 
+ BrownBear can install and run **browser extensions** (Chrome/Edge/Firefox `.crx`/`.zip`/`.xpi`), the
+ way [Orion](https://kagi.com/orion/) and [Gear Browser](https://gear4.app/) do — not just userscripts.
++Before an archive from a store page, pasted link, curated recommendation, or local file is written
++to disk, every path asks the user to review its required API permissions, host access, content-script
++matches, and optional permissions that may be requested later. Cancelling a reinstall leaves the
++installed copy in place. The review is based on the package manifest; it does not scan the extension's
++code or certify safety. Optional access still requires a separate prompt when requested at runtime.
+ All build phases have shipped: the install/manage pipeline, content scripts, `declarativeNetRequest`
+ content blocking, **headless background service workers** (classic *and* ES-module), popup/options/
+ **side-panel** pages, content↔background **and** background↔content messaging + long-lived ports, and a
+diff --git a/project.yml b/project.yml
+index 7c5aa4f..19ffc06 100644
+--- a/project.yml
++++ b/project.yml
+@@ -45,7 +45,7 @@ targets:
+     info:
+       path: BrownBear/App/Info.plist
+       properties:
+-        CFBundleDisplayName: BrownBear
++        CFBundleDisplayName: Wolvion Browser
+         CFBundleShortVersionString: "$(MARKETING_VERSION)"
+         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+         UILaunchStoryboardName: ""
+@@ -77,7 +77,7 @@ targets:
+         LSSupportsOpeningDocumentsInPlace: true
+     settings:
+       base:
+-        PRODUCT_BUNDLE_IDENTIFIER: com.brownbear.app
++        PRODUCT_BUNDLE_IDENTIFIER: com.wolvion.browser
+         INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleLightContent
+         TARGETED_DEVICE_FAMILY: "1,2"
+         # The BrownBear bear mark (the same face shown on the New Tab page), with a light and a dark
