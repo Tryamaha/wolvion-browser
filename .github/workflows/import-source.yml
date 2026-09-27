@@ -1,0 +1,33 @@
+name: Import Wolvion source
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/import-source.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Import pinned source and Wolvion changes
+        run: |
+          set -euo pipefail
+          if [ -f BrownBear/App/AppDelegate.swift ]; then
+            echo "Source already imported"
+            exit 0
+          fi
+          git clone https://github.com/DudeAint/brownbear.git /tmp/brownbear-source
+          git -C /tmp/brownbear-source checkout 052389f67d6a2b6763e8a7d1086d6a94db957ae4
+          git -C /tmp/brownbear-source apply "$GITHUB_WORKSPACE/.github/wolvion.patch"
+          rsync -a --exclude=.git /tmp/brownbear-source/ "$GITHUB_WORKSPACE/"
+          rm -f .github/wolvion.patch .github/workflows/import-source.yml IMPORT.md
+          git config user.name "Wolvion Source Import"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(browser): import Wolvion iOS source"
+          git push origin HEAD:main
