@@ -1,0 +1,234 @@
+//
+//  SettingsView.swift
+//  BrownBear
+//
+//  The app Settings screen (a dashboard tab). Holds preferences that affect the whole browser —
+//  the default search engine and a one-tap clear-browsing-data — backed by UserDefaults via the
+//  same keys AppSettings reads, so changes take effect immediately (next omnibox submit / NTP).
+//
+
+import SwiftUI
+import WebKit
+
+struct SettingsView: View {
+
+    @AppStorage(AppSettings.Key.searchEngine) private var searchEngineRaw = SearchEngine.google.rawValue
+    @AppStorage(AppSettings.Key.autoUpdateScripts) private var autoUpdateScripts = true
+    @AppStorage(AppSettings.Key.hideBarsOnScroll) private var hideBarsOnScroll = true
+    @AppStorage(AppSettings.Key.addressBarPosition) private var addressBarPositionRaw = AddressBarPosition.top.rawValue
+    @AppStorage(AppSettings.Key.userScriptInstallPolicy) private var installPolicyRaw = UserScriptInstallPolicy.ask.rawValue
+    @AppStorage(AppSettings.Key.userScriptWorld) private var userScriptWorldRaw = UserScriptWorld.managerChoice.rawValue
+    @AppStorage(AppSettings.Key.keepVideosInline) private var keepVideosInline = true
+    @AppStorage(AppSettings.Key.theme) private var themeRaw = AppTheme.system.rawValue
+    @AppStorage(AppSettings.Key.tabSwitcherStyle) private var tabSwitcherStyleRaw = TabSwitcherStyle.grid.rawValue
+    @AppStorage(AppSettings.Key.verticalTabsSide) private var verticalTabsSideRaw = VerticalTabsSide.right.rawValue
+    @AppStorage("bbWebInspector") private var webInspector = false
+    @AppStorage("bbVerboseExtLogs") private var verboseExtLogs = false
+    @AppStorage("bbPersistExtPageIDB") private var persistExtPageIDB = false
+    @ObservedObject private var proxyManager = ProxyManager.shared
+    @State private var isClearing = false
+    @State private var didClear = false
+    @State private var confirmingClear = false
+
+    var body: some View {
+        Form {
+            Section("Search") {
+                Picker("Search engine", selection: $searchEngineRaw) {
+                    ForEach(SearchEngine.allCases) { engine in
+                        Text(engine.title).tag(engine.rawValue)
+                    }
+                }
+            }
+
+            Section("Appearance") {
+                Picker("Theme", selection: $themeRaw) {
+                    ForEach(AppTheme.allCases) { theme in
+                        Text(theme.title).tag(theme.rawValue)
+                    }
+                }
+                .onChange(of: themeRaw) { _ in
+                    Task { @MainActor in ThemeController.apply() }
+                }
+                Text("Light & Dark follow your device by default. OG BrownBear restores the original warm look.")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+
+                Picker("Address bar", selection: $addressBarPositionRaw) {
+                    ForEach(AddressBarPosition.allCases) { pos in
+                        Text(pos.title).tag(pos.rawValue)
+                    }
+                }
+                .onChange(of: addressBarPositionRaw) { _ in
+                    NotificationCenter.default.post(name: .brownBearChromeLayoutChanged, object: nil)
+                }
+                Toggle("Hide bar while scrolling", isOn: $hideBarsOnScroll)
+                    .tint(BBTheme.Color.toggleOn)
+                Text("The address bar slides away as you scroll down a page and returns when you scroll up. "
+                    + "Set it at the top or, Safari-style, at the bottom (where the toolbar hides with it).")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+
+                Picker("Tab switcher", selection: $tabSwitcherStyleRaw) {
+                    ForEach(TabSwitcherStyle.allCases) { style in
+                        Text(style.title).tag(style.rawValue)
+                    }
+                }
+                if tabSwitcherStyleRaw == TabSwitcherStyle.vertical.rawValue {
+                    Picker("Panel side", selection: $verticalTabsSideRaw) {
+                        ForEach(VerticalTabsSide.allCases) { side in
+                            Text(side.title).tag(side.rawValue)
+                        }
+                    }
+                }
+                Text("Grid shows tabs as snapshot cards. Vertical list is an Orion/Kagi-style panel that "
+                    + "slides in over the page and lists your tabs as rows — pick which edge it opens from.")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+            }
+
+            Section("Media") {
+                Toggle("Keep videos inline", isOn: $keepVideosInline)
+                    .tint(BBTheme.Color.toggleOn)
+                Text("Stops a site or player from forcing a video fullscreen, so it stays in the page — handy "
+                    + "for automation that needs the page visible while a video plays. You can still go "
+                    + "fullscreen yourself with the video's button. Reopen BrownBear to apply.")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+            }
+
+            Section("Network") {
+                NavigationLink {
+                    ProxyView()
+                } label: {
+                    HStack {
+                        Label("Proxy", systemImage: "network")
+                        Spacer()
+                        if proxyManager.enabled, let active = proxyManager.active {
+                            Text(active.displayName)
+                                .font(.caption)
+                                .foregroundStyle(BBTheme.Color.textSecondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+                Text("Route all browsing through an HTTP/HTTPS/SOCKS5 proxy — one active at a time. "
+                    + "Requires iOS 17 or later.")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+            }
+
+            Section("Developer") {
+                Toggle("Web Inspector", isOn: $webInspector)
+                    .tint(BBTheme.Color.toggleOn)
+                Text("Lets you attach Safari's Web Inspector (on a Mac: Develop → your device) to inspect "
+                    + "page, userscript, and extension execution — full console, breakpoints, network. Off by "
+                    + "default because inspectable web content is a privacy surface. Open new tabs to apply.")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+
+                Toggle("Verbose extension logs", isOn: $verboseExtLogs)
+                    .tint(BBTheme.Color.toggleOn)
+                Text("Adds the full extension-runtime trace — message ports, the cross-world relay, and "
+                    + "storage traffic — to the Logs tab. Off by default so the Logs show real signal "
+                    + "(script injection, errors) instead of being buried by a busy manager's debug chatter.")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+
+                Toggle("Persist extension-page data", isOn: $persistExtPageIDB)
+                    .tint(BBTheme.Color.toggleOn)
+                Text("Keeps an extension popup/options page's IndexedDB data across reloads (otherwise it's "
+                    + "in-memory and resets each open). Experimental and off by default — verify your "
+                    + "extensions behave before relying on it. Reopen the extension page to apply.")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+            }
+
+            Section("Userscripts") {
+                Toggle("Update scripts automatically", isOn: $autoUpdateScripts)
+                    .tint(BBTheme.Color.toggleOn)
+                Text("Checks each script's @updateURL/@downloadURL for a newer @version and reinstalls it.")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+
+                Picker("Install .user.js with", selection: $installPolicyRaw) {
+                    ForEach(UserScriptInstallPolicy.allCases) { policy in
+                        Text(policy.title).tag(policy.rawValue)
+                    }
+                }
+                Text("When you open a userscript and a manager extension (ScriptCat, Violentmonkey, …) is "
+                    + "installed: ask each time, always use BrownBear's built-in installer, or always hand off "
+                    + "to a userscript extension.")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+
+                Picker("Userscript world", selection: $userScriptWorldRaw) {
+                    ForEach(UserScriptWorld.allCases) { world in
+                        Text(world.title).tag(world.rawValue)
+                    }
+                }
+                Text("Where a manager's userscripts run. Manager's choice (the default) honors each script's "
+                    + "@inject-into/@grant like Chrome, so most see unsafeWindow/page globals like Violentmonkey. "
+                    + "User Script World forces them into an isolated sandbox — immune to a page breaking its own "
+                    + "globals. Page (Main) World gives raw page access but no GM_*. All Isolated also collapses "
+                    + "the manager's OWN runtime (e.g. ScriptCat's inject/content/scripting) into that one "
+                    + "world, so its cross-context messaging never crosses worlds — try this if a ScriptCat "
+                    + "script runs but does nothing in the default mode. Reload pages after changing this.")
+                    .font(.caption)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+            }
+
+            Section("Privacy") {
+                Button(role: .destructive) { confirmingClear = true } label: {
+                    HStack {
+                        Label("Clear browsing data", systemImage: "trash")
+                        Spacer()
+                        if isClearing { ProgressView() }
+                    }
+                }
+                .disabled(isClearing)
+                if didClear {
+                    Text("Cleared cookies, cache, website data, and history.")
+                        .font(.caption)
+                        .foregroundStyle(BBTheme.Color.textSecondary)
+                }
+            }
+
+            Section {
+                LabeledContent("Version", value: appVersion)
+                    .foregroundStyle(BBTheme.Color.textSecondary)
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(BBTheme.backgroundGradient)
+        .tint(BBTheme.Color.accent)
+        .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("Clear browsing data?", isPresented: $confirmingClear, titleVisibility: .visible) {
+            Button("Clear", role: .destructive) { clearBrowsingData() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This clears cookies, cache, website data, and browsing history. Bookmarks and "
+                + "downloaded files are kept.")
+        }
+    }
+
+    private func clearBrowsingData() {
+        isClearing = true
+        didClear = false
+        Task {
+            await WKWebsiteDataStore.default().removeData(
+                ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+                modifiedSince: .distantPast)
+            await BrownBearServices.shared.historyStore.clear()
+            await GMAssetCache.shared.clear()
+            isClearing = false
+            didClear = true
+        }
+    }
+
+    private var appVersion: String {
+        let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "\(short) (\(build))"
+    }
+}

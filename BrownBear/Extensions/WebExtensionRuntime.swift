@@ -1,0 +1,811 @@
+//
+//  WebExtensionRuntime.swift
+//  BrownBear
+//
+//  The coordinator for extension BACKGROUND execution (Module 6, Phase 2). It owns one
+//  `WebExtensionBackgroundContext` per enabled extension that declares a background, reconciles that
+//  set whenever extensions change, routes content-script → background runtime messages, and fans
+//  chrome.storage changes out to the right worker's onChanged listeners.
+//
+//  A single instance lives on `BrownBearServices`; the content-script bridge (WebExtensionMessage-
+//  Router) delivers messages through it, and it self-observes the change notifications so the
+//  foreground engine doesn't have to know it exists.
+//
+
+import Foundation
+import UIKit
+
+// Not `final`: WebExtensionEventEmitterTests subclasses it (SpyRuntime) to capture the event fan-out
+// without booting a JSContext. dispatchEventToAll is likewise overridable.
+@MainActor
+class WebExtensionRuntime {
+
+    private let store: WebExtensionStore
+    private let storage: WebExtensionStorage
+    private let logStore: LogStore
+
+    private var contexts: [String: WebExtensionBackgroundContext] = [:]
+    private var observers: [NSObjectProtocol] = []
+
+    /// chrome.runtime.connect/onConnect long-lived ports. Owned here because the runtime is the one
+    /// object that reaches every surface (background workers + the routers that own content/page
+    /// endpoints). The hub delegates background-side delivery back to this runtime (see the
+    /// WebExtensionPortBackgroundDeliverer conformance), which routes to the right worker's context.
+    let portHub = WebExtensionPortHub()
+
+    /// chrome.offscreen documents (one hidden WKWebView per extension). Owned here because the runtime
+    /// is the app-lifetime object that already holds `host` (the view container) and fans runtime
+    /// messages to every page — an offscreen document is just another message-receiving page.
+    let offscreenManager = WebExtensionOffscreenManager()
+
+    /// chrome.downloads state (per-extension download records + URLSession tasks). Owned here so it can
+    /// fan onCreated/onChanged/onErased into the owning worker and be torn down on unload.
+    let downloadsManager = WebExtensionDownloadsManager()
+
+    /// Live extension PAGES (popups/options) that want browser-pushed chrome.tabs/webNavigation
+    /// events, held weakly so a dismissed page is skipped (and cleaned up) on the next fan-out.
+    private final class WeakEventReceiver { weak var value: WebExtensionEventReceiver?; init(_ v: WebExtensionEventReceiver) { value = v } }
+    private var eventReceivers: [ObjectIdentifier: WeakEventReceiver] = [:]
+    /// Each running worker's granted permissions, cached so the webNavigation gate is synchronous.
+    private var permissionsByExtension: [String: Set<String>] = [:]
+
+    /// chrome.tabs bridge to the browser; pushed to every background context. Set after the browser
+    /// view controller loads (contexts may already exist), so propagate to the live ones too.
+    weak var host: WebExtensionBridgeHost? {
+        didSet { for context in contexts.values { context.host = host } }
+    }
+    /// chrome.cookies bridge to the browser; pushed to every background context, same lifecycle as host.
+    weak var cookieHost: WebExtensionCookieBridgeHost? {
+        didSet { for context in contexts.values { context.cookieHost = cookieHost } }
+    }
+    private var didStart = false
+    // Single-flight reconciliation: reload() is async and suspends at every actor await, so two
+    // overlapping calls (the initial start() one and a change-notification one) could otherwise
+    // both boot the same extension and leak the loser's JSContext/timers. We coalesce instead.
+    private var isReloading = false
+    private var reloadRequested = false
+
+    init(store: WebExtensionStore = BrownBearServices.shared.webExtensionStore,
+         storage: WebExtensionStorage = BrownBearServices.shared.webExtensionStorage,
+         logStore: LogStore = BrownBearServices.shared.logStore) {
+        self.store = store
+        self.storage = storage
+        self.logStore = logStore
+        self.portHub.backgroundDeliverer = self
+    }
+
+    deinit {
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    /// Begin observing change notifications and load the current background set. Idempotent.
+    func start() {
+        guard !didStart else { return }
+        didStart = true
+
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .brownBearExtensionsDidChange, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in await self?.reload() }
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .brownBearExtensionStorageDidChange, object: nil, queue: .main) { [weak self] note in
+            Task { @MainActor in self?.handleStorageChange(note) }
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .brownBearExtensionCookieDidChange, object: nil, queue: .main) { [weak self] note in
+            Task { @MainActor in self?.handleCookieChange(note) }
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .brownBearExtensionNotificationEvent, object: nil, queue: .main) { [weak self] note in
+            Task { @MainActor in self?.handleNotificationEvent(note) }
+        })
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .brownBearExtensionPermissionsDidChange, object: nil, queue: .main) { [weak self] note in
+            Task { @MainActor in self?.handlePermissionsChange(note) }
+        })
+        // chrome.idle.onStateChanged: app foreground/background + device lock/unlock drive the idle state
+        // (iOS can't observe true user idle). Coalesced so only real transitions fire. The lock
+        // notification fires just before lock while applicationState is still .active, so we force the
+        // "locked" state from the NOTIFICATION rather than recomputing (which would race the state change).
+        let lockName = UIApplication.protectedDataWillBecomeUnavailableNotification
+        for name: NSNotification.Name in [UIApplication.didBecomeActiveNotification,
+                                          UIApplication.willResignActiveNotification,
+                                          UIApplication.didEnterBackgroundNotification,
+                                          UIApplication.protectedDataDidBecomeAvailableNotification,
+                                          lockName] {
+            observers.append(NotificationCenter.default.addObserver(
+                forName: name, object: nil, queue: .main) { [weak self] note in
+                let forced = note.name == lockName ? "locked" : nil
+                Task { @MainActor in self?.pushIdleStateIfChanged(forced: forced) }
+            })
+        }
+
+        Task { await reload() }
+    }
+
+    /// Deliver chrome.idle.onStateChanged to every running worker when the state changes. `forced` pins
+    /// the state for a notification whose meaning is unambiguous (lock), avoiding a recompute that races
+    /// the underlying state transition; otherwise we recompute from app/device condition.
+    private var lastIdleState: String?
+    private func pushIdleStateIfChanged(forced: String? = nil) {
+        let state = forced ?? WebExtensionBackgroundContext.currentIdleState()
+        guard state != lastIdleState else { return }
+        lastIdleState = state
+        for context in contexts.values { context.fireIdleStateChanged(state) }
+    }
+
+    // MARK: - Message bus
+
+    /// Deliver a `chrome.runtime.sendMessage` to its extension's other contexts and return the first
+    /// listener's response (`["value": ...]`) or nil if nothing answered. Chrome delivers to every
+    /// context of the extension (background worker + open popup/options pages) except the sender; the
+    /// first context that answers wins. `senderToken` is the sending page's token (if a page sent it),
+    /// so that page is skipped. Content scripts receive via tabs.sendMessage, not this fan-out.
+    func sendRuntimeMessage(_ message: Any, sender: [String: Any], to extensionID: String,
+                            senderToken: String? = nil, senderIsBackground: Bool = false) async -> [String: Any]? {
+        // Track whether ANY context of this extension had a receiving onMessage listener. Chrome only
+        // raises "Could not establish connection. Receiving end does not exist." when NOTHING received.
+        var sawReceiver = false
+        // Background worker first (the common responder), then open extension pages — but when the
+        // BACKGROUND is the sender (chrome.runtime.sendMessage from the worker), skip it: Chrome never
+        // delivers a context its own broadcast, and the worker fans out only to its pages (popup /
+        // options / offscreen document).
+        if !senderIsBackground, let context = contexts[extensionID] {
+            if let response = await context.deliverRuntimeMessage(message: message, sender: sender) {
+                // A `{__bbNoListener:true}` reply means the worker booted but registered no onMessage
+                // listener — keep looking. Any other reply is an actual answer.
+                if response["__bbNoListener"] == nil { return response }
+            } else {
+                sawReceiver = true   // had a listener that declined or never answered (channel existed)
+            }
+        }
+        for box in eventReceivers.values {
+            // Skip a registered-but-dead page (web view gone): it can't receive, so it must not count
+            // toward `sawReceiver` — otherwise it would suppress the no-receiving-end lastError.
+            guard let receiver = box.value, receiver.receiverExtensionID == extensionID,
+                  receiver.isDeliverable else { continue }
+            sawReceiver = true   // an open page of this extension exists to receive
+            if let response = await receiver.deliverRuntimeMessage(message: message, sender: sender,
+                                                                   senderToken: senderToken) {
+                return response
+            }
+        }
+        // Nobody answered. If no context had a receiving listener at all, surface Chrome's no-receiver
+        // signal so the sending runtime can set chrome.runtime.lastError; otherwise the message was
+        // received but declined → resolve to undefined with no error.
+        return sawReceiver ? nil : ["__bbNoReceiver": true]
+    }
+
+    /// Deliver a USER_SCRIPT-world script's message to its worker's chrome.runtime.onUserScriptMessage
+    /// (MV3 User Scripts channel). Only the background worker receives it (not pages). Returns the
+    /// worker's `["value": …]` answer, or nil.
+    func deliverUserScriptMessage(extensionID: String, message: Any, sender: [String: Any]) async -> [String: Any]? {
+        await contexts[extensionID]?.fireUserScriptMessage(message: message, sender: sender)
+    }
+
+    /// Append a popup/options PAGE's forwarded console line / uncaught error to this extension's log,
+    /// so an otherwise-invisible blank-page failure is diagnosable in the dashboard. `source: .page`.
+    func logFromPage(extensionID: String, level: String, message: String) async {
+        let resolved = LogEntry.Level(rawValue: level) ?? .info
+        // Verbose extension-runtime diagnostics (port-relay/perf-bridge/storage traffic) are emitted at
+        // `.debug` and, on a busy manager like ScriptCat, flood the Logs tab hundreds of lines deep —
+        // burying the signal (the `.info` injection summary, real `.error` failures). Drop `.debug` unless
+        // the user opts into verbose logging (Settings → Developer). info/warn/error always pass.
+        guard Self.verboseExtLogs || resolved != .debug else { return }
+        let name = await store.ext(for: extensionID)?.displayName
+        let entry = LogEntry(scriptID: nil, scriptName: name,
+                             level: resolved,
+                             message: message, context: .foreground, source: .page)
+        await logStore.append(entry)
+    }
+
+    /// Whether `.debug`-level extension diagnostics reach the Logs tab. Default OFF so the dashboard shows
+    /// real signal; the "Verbose extension logs" Developer toggle turns the full port/relay trace back on.
+    /// `nonisolated` so the background context's `@Sendable` logSink closure can read it off the main actor —
+    /// it only reads thread-safe `UserDefaults`, holding no main-actor state.
+    nonisolated static var verboseExtLogs: Bool { UserDefaults.standard.bool(forKey: "bbVerboseExtLogs") }
+
+    /// Give an extension's background worker the chance to serve an unpackaged extension-scheme request
+    /// from its `fetch` event handler (e.g. Stylus's `chrome-extension://<id>/data?…`). Called by the
+    /// URL scheme handler only after a packaged file lookup misses. Returns nil if the extension has no
+    /// running worker or the worker doesn't claim the request — the scheme handler then 404s as before.
+    func serviceWorkerFetch(extensionID: String, urlString: String, method: String,
+                            headersJSON: String) async -> WebExtensionBackgroundContext.ServiceWorkerFetchResponse? {
+        guard let context = contexts[extensionID] else { return nil }
+        return await context.serviceWorkerFetch(urlString: urlString, method: method, headersJSON: headersJSON)
+    }
+
+    /// Deliver chrome.action.onClicked to an extension's background worker (when the action has no
+    /// popup). No-op if the extension has no running background context. `tab` is a chrome.tabs Tab
+    /// record (or nil if there's no active tab).
+    func fireActionClicked(extensionID: String, tab: [String: Any]?) {
+        contexts[extensionID]?.fireActionClicked(tab: tab)
+    }
+
+    /// Extension IDs whose worker has registered a chrome.action/pageAction.onClicked listener. Set by the
+    /// worker (via __bb_note_action_onclicked) the moment one registers, and read on the toolbar-tap path:
+    /// an action with no popup AND no onClicked handler opens the extension's options page (the action a
+    /// user expects from a configure-only extension) rather than firing a click nothing is listening for.
+    private var actionClickedExtensionIDs: Set<String> = []
+    func noteActionClickedListener(extensionID: String) { actionClickedExtensionIDs.insert(extensionID) }
+    func hasActionClickedListener(extensionID: String) -> Bool { actionClickedExtensionIDs.contains(extensionID) }
+
+    // MARK: - chrome.sidePanel / sidebar_action
+
+    /// Per-extension side-panel state mutated by chrome.sidePanel.setOptions/setPanelBehavior. `path` is a
+    /// runtime override of the manifest's `side_panel.default_path`; `enabled` gates whether open() shows it;
+    /// `openOnActionClick` mirrors setPanelBehavior({openPanelOnActionClick}) — when true the toolbar tap
+    /// opens the panel (Chrome's primary way a side panel is surfaced). tabId scoping isn't modeled (iOS is
+    /// single-window); the most recent global setOptions wins.
+    private struct SidePanelState { var path: String?; var enabled = true; var openOnActionClick = false }
+    private var sidePanelStates: [String: SidePanelState] = [:]
+
+    /// chrome.sidePanel.setOptions — update the path and/or enabled flag (each applied only when provided,
+    /// matching Chrome's partial-update semantics).
+    func setSidePanelOptions(extensionID: String, path: String?, enabled: Bool?) {
+        var state = sidePanelStates[extensionID] ?? SidePanelState()
+        if let path { state.path = path }
+        if let enabled { state.enabled = enabled }
+        sidePanelStates[extensionID] = state
+    }
+
+    /// chrome.sidePanel.setPanelBehavior — whether a toolbar action click opens the side panel.
+    func setSidePanelBehavior(extensionID: String, openOnActionClick: Bool) {
+        var state = sidePanelStates[extensionID] ?? SidePanelState()
+        state.openOnActionClick = openOnActionClick
+        sidePanelStates[extensionID] = state
+    }
+
+    /// chrome.sidePanel.getOptions — the current `{path, enabled}` (path is NSNull when none is set yet).
+    func sidePanelOptions(extensionID: String) -> [String: Any] {
+        let state = sidePanelStates[extensionID]
+        return ["path": state?.path ?? NSNull(), "enabled": state?.enabled ?? true]
+    }
+
+    /// chrome.sidePanel.getPanelBehavior — the current `{openPanelOnActionClick}`.
+    func sidePanelBehavior(extensionID: String) -> [String: Any] {
+        ["openPanelOnActionClick": sidePanelStates[extensionID]?.openOnActionClick ?? false]
+    }
+
+    /// A runtime path override from setOptions, or nil to fall back to the manifest's default path.
+    func sidePanelPathOverride(extensionID: String) -> String? { sidePanelStates[extensionID]?.path }
+    /// Whether a toolbar action click should open the side panel (setPanelBehavior opt-in).
+    func sidePanelOpensOnActionClick(extensionID: String) -> Bool { sidePanelStates[extensionID]?.openOnActionClick ?? false }
+    /// Whether the side panel is enabled (setOptions({enabled:false}) suppresses open()).
+    func sidePanelEnabled(extensionID: String) -> Bool { sidePanelStates[extensionID]?.enabled ?? true }
+
+    /// chrome.sidePanel.open — present the extension's side-panel page over the browser (a sheet on iOS),
+    /// routed to the live browser through the bridge host. A no-op if the panel is disabled or the host has
+    /// no window yet.
+    func presentSidePanel(extensionID: String) {
+        guard sidePanelEnabled(extensionID: extensionID) else { return }
+        host?.webExtPresentSidePanel(extensionID: extensionID)
+    }
+
+    // MARK: - chrome.offscreen
+
+    /// chrome.offscreen.createDocument — create the extension's single hidden offscreen document.
+    /// Returns `[:]` on success or `["error": <message>]` for the worker's Promise to reject with.
+    func createOffscreenDocument(extensionID: String, path: String, reasons: [String],
+                                 justification: String) async -> [String: Any] {
+        guard let ext = await store.ext(for: extensionID) else { return ["error": "Unknown extension."] }
+        let container = host?.webExtOffscreenContainer()
+        return await offscreenManager.createDocument(ext: ext, path: path, reasons: reasons,
+                                                     justification: justification, container: container)
+    }
+
+    /// chrome.offscreen.hasDocument.
+    func hasOffscreenDocument(extensionID: String) -> Bool {
+        offscreenManager.hasDocument(extensionID: extensionID)
+    }
+
+    /// chrome.offscreen.closeDocument — returns false if there was no document to close.
+    func closeOffscreenDocument(extensionID: String) -> Bool {
+        offscreenManager.closeDocument(extensionID: extensionID)
+    }
+
+    // MARK: - chrome.downloads
+
+    func downloadsDownload(extensionID: String, options: [String: Any]) -> [String: Any] {
+        downloadsManager.download(extensionID: extensionID, options: options)
+    }
+    func downloadsSearch(extensionID: String, query: [String: Any]) -> [[String: Any]] {
+        downloadsManager.search(extensionID: extensionID, query: query)
+    }
+    func downloadsCancel(extensionID: String, id: Int) -> Bool {
+        downloadsManager.cancel(extensionID: extensionID, id: id)
+    }
+    func downloadsPause(extensionID: String, id: Int) -> Bool {
+        downloadsManager.pause(extensionID: extensionID, id: id)
+    }
+    func downloadsResume(extensionID: String, id: Int) -> Bool {
+        downloadsManager.resume(extensionID: extensionID, id: id)
+    }
+    func downloadsErase(extensionID: String, query: [String: Any]) -> [Int] {
+        downloadsManager.erase(extensionID: extensionID, query: query)
+    }
+    func downloadsRemoveFile(extensionID: String, id: Int) -> Bool {
+        downloadsManager.removeFile(extensionID: extensionID, id: id)
+    }
+
+    /// Deliver a chrome.downloads.onCreated/onChanged/onErased event to the owning extension's worker.
+    func fireDownloadEvent(extensionID: String, kind: String, payload: Any) {
+        contexts[extensionID]?.fireDownloadEvent(kind: kind, payload: JSONSanitize.string(payload))
+    }
+
+    /// chrome.runtime.getContexts — the extension's live contexts: its background worker plus every open
+    /// page (popup / options / offscreen document, all of which are registered event receivers).
+    /// `filter` honors `contextTypes` and `documentUrls` (the common cases; e.g. an extension checks
+    /// `getContexts({contextTypes:['OFFSCREEN_DOCUMENT']})` before creating one).
+    func getContexts(extensionID: String, filter: [String: Any]) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        if contexts[extensionID] != nil {
+            out.append(["contextId": "background", "contextType": "BACKGROUND",
+                        "documentUrl": NSNull(), "documentOrigin": NSNull(),
+                        "frameId": -1, "tabId": -1, "windowId": -1, "incognito": false])
+        }
+        for box in eventReceivers.values {
+            guard let receiver = box.value, receiver.receiverExtensionID == extensionID,
+                  let record = receiver.contextRecord() else { continue }
+            out.append(record)
+        }
+        if let types = filter["contextTypes"] as? [String], !types.isEmpty {
+            out = out.filter { types.contains(($0["contextType"] as? String) ?? "") }
+        }
+        if let urls = filter["documentUrls"] as? [String], !urls.isEmpty {
+            out = out.filter { ($0["documentUrl"] as? String).map(urls.contains) ?? false }
+        }
+        return out
+    }
+
+    /// The ids of running workers that CLAIM this `.user.js` via a webRequest.onBeforeRequest filter
+    /// (detection only — does not invoke the listener). For listing install targets in the picker.
+    func userScriptWebRequestManagerIDs(url: URL) async -> [String] {
+        let urlString = url.absoluteString
+        var ids: [String] = []
+        // Sorted iteration: `contexts` is a Dictionary (undefined order); the picker/route order must be
+        // deterministic so the offered target doesn't flip between runs.
+        for extID in contexts.keys.sorted() {
+            guard let context = contexts[extID] else { continue }
+            if await context.hasUserScriptWebRequestListener(url: urlString) { ids.append(extID) }
+        }
+        return ids
+    }
+
+    // MARK: - Blocking webRequest on frame navigations
+
+    /// The outcome of evaluating blocking webRequest.onBeforeRequest listeners for a frame navigation.
+    enum WebRequestNavOutcome { case allow, cancel, redirect(String) }
+
+    /// Whether any running worker has a (non-userscript) blocking webRequest.onBeforeRequest listener. Set
+    /// by the worker (via __bb_note_blocking_webrequest) the moment one registers, and read SYNCHRONOUSLY on
+    /// the navigation hot path so the per-frame decision dispatch is skipped entirely for everyone without
+    /// such an extension. Stays true for the session — a stale flag only costs a cheap allow-decision.
+    private(set) var hasBlockingWebRequest = false
+    func noteBlockingWebRequest(extensionID: String) { hasBlockingWebRequest = true }
+
+    /// The webRequest decision for a FRAME navigation across all running workers: the first listener that
+    /// cancels or redirects wins (Chrome's blocking precedence). `type` is "main_frame" / "sub_frame". This
+    /// is the one request class WKWebView lets us intercept (WKNavigationDelegate), so an MV2 webRequest
+    /// blocker can block ad iframes / redirect-trackers even though static subresources have no hook.
+    func webRequestNavDecision(url: String, type: String, tabId: Int) async -> WebRequestNavOutcome {
+        for extID in contexts.keys.sorted() {
+            guard let context = contexts[extID] else { continue }
+            let json = await context.webRequestNavDecision(url: url, type: type, tabId: tabId)
+            guard !json.isEmpty, let data = json.data(using: .utf8),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+            if (obj["cancel"] as? Bool) == true { return .cancel }
+            if let redirect = obj["redirectUrl"] as? String, !redirect.isEmpty { return .redirect(redirect) }
+        }
+        return .allow
+    }
+
+    /// Hand a `.user.js` navigation to ONE userscript manager's worker (picker routing), through BOTH
+    /// detection channels a manager may use — webRequest.onBeforeRequest (Violentmonkey) AND webNavigation
+    /// onBeforeNavigate/onCommitted/onCompleted (Tampermonkey, whose default `scriptUrlDetection:"auto"`
+    /// watches webNavigation, not webRequest). `tabId` is the REAL tab the install was triggered from: a
+    /// manager opens its confirm page in that tab, and a detector that gates on `tabId > 0` (Tampermonkey)
+    /// would otherwise early-return. Generic — no manager-specific knowledge.
+    func dispatchUserScript(extensionID: String, url: URL, tabId: Int) async -> Bool {
+        guard let context = contexts[extensionID] else { return false }
+        let handled = await context.dispatchUserScriptWebRequest(url: url.absoluteString, tabId: tabId)
+        context.dispatchUserScriptWebNavigation(url: url.absoluteString, tabId: tabId)
+        return handled
+    }
+
+    /// Deliver chrome.contextMenus.onClicked to an extension's background worker. No-op if the
+    /// extension has no running background context. `info` is the OnClickData object; `tab` is a
+    /// chrome.tabs Tab record (or nil). Chrome fires this event only in the background/event page.
+    func fireContextMenuClicked(extensionID: String, info: [String: Any], tab: [String: Any]?) {
+        contexts[extensionID]?.fireContextMenuClicked(info: info, tab: tab)
+    }
+
+    // MARK: - Browser-pushed events (chrome.tabs.* / chrome.webNavigation.*)
+
+    /// Register a live extension page (popup/options) to receive browser-pushed events. Held weakly.
+    func registerEventReceiver(_ receiver: WebExtensionEventReceiver) {
+        eventReceivers[ObjectIdentifier(receiver)] = WeakEventReceiver(receiver)
+    }
+
+    func unregisterEventReceiver(_ receiver: WebExtensionEventReceiver) {
+        eventReceivers.removeValue(forKey: ObjectIdentifier(receiver))
+    }
+
+    /// Fan one browser-pushed event out to every background worker and live popup of every enabled
+    /// extension. `argsJSON` is the event's already-encoded argument array. `requiredPermission`
+    /// (e.g. "webNavigation") gates delivery to extensions that declared it; nil = deliver to all
+    /// (chrome.tabs.* needs no permission). Overridable so tests can spy on the fan-out.
+    func dispatchEventToAll(name: String, argsJSON: String, requiredPermission: String? = nil) {
+        for (id, context) in contexts {
+            if let requiredPermission, permissionsByExtension[id]?.contains(requiredPermission) != true { continue }
+            context.dispatchExtEvent(name: name, argsJSON: argsJSON)
+        }
+        for box in eventReceivers.values {
+            guard let receiver = box.value else { continue }
+            if let requiredPermission, !receiver.receiverPermissions.contains(requiredPermission) { continue }
+            receiver.dispatchExtEvent(name: name, argsJSON: argsJSON)
+        }
+    }
+
+    // MARK: - Reconciliation
+
+    /// Bring the running set of background contexts in line with the enabled extensions. Coalesced:
+    /// if a reload is requested while one is in flight, exactly one more pass runs afterward.
+    func reload() async {
+        if isReloading { reloadRequested = true; return }
+        isReloading = true
+        defer { isReloading = false }
+        repeat {
+            reloadRequested = false
+            await performReload()
+        } while reloadRequested
+    }
+
+    private func performReload() async {
+        let enabled = await store.enabledExtensions()
+        var wanted: [String: WebExtension] = [:]
+        for ext in enabled where Self.hasBackground(ext) { wanted[ext.id] = ext }
+
+        // Tear down contexts for extensions that are gone or disabled.
+        for (id, context) in contexts where wanted[id] == nil {
+            context.shutdown()
+            contexts.removeValue(forKey: id)
+            permissionsByExtension.removeValue(forKey: id)
+            // Drop this extension's context-menu items so stale rows never show after disable/uninstall.
+            BrownBearServices.shared.webExtensionContextMenuStore.forgetExtension(id)
+            // Close any offscreen document — its worker is gone, so the hidden web view must not linger.
+            offscreenManager.close(extensionID: id)
+            // Cancel any in-flight downloads the gone worker started.
+            downloadsManager.close(extensionID: id)
+            // Clear any proxy config the gone worker applied so traffic is no longer routed
+            // through a server belonging to an extension the user disabled or uninstalled.
+            WebExtensionProxyManager.shared.clear(extensionID: id)
+        }
+
+        // Spin up newly enabled extensions.
+        for (id, ext) in wanted where contexts[id] == nil {
+            await startContext(for: ext)
+        }
+    }
+
+    private static func hasBackground(_ ext: WebExtension) -> Bool {
+        guard let background = ext.manifest?.background else { return false }
+        // MV2 `background.page` (uBlock Origin's background.html) boots too: its <script> tags are the
+        // background source, extracted in startContext. Ignoring it left such extensions with NO
+        // background at all — a dead chrome.* surface and a popup waiting forever on a worker.
+        return background.serviceWorker != nil || !background.scripts.isEmpty || background.page != nil
+    }
+
+    /// Record that an extension's background worker failed to boot (missing/mis-pathed source), so a broken
+    /// manifest shows an "extension X never started" line instead of failing silently. The legit
+    /// no-background (content-only) case is NOT routed here.
+    private func logBootFailure(_ ext: WebExtension, _ message: String) {
+        let entry = LogEntry(scriptID: nil, scriptName: ext.displayName, level: .error,
+                             message: message, context: .background, source: .engine)
+        let store = logStore
+        Task { await store.append(entry) }
+    }
+
+    private func startContext(for ext: WebExtension) async {
+        guard let manifest = ext.manifest, let background = manifest.background else { return }
+
+        // A module service worker is linked from its package in-context, so we pass the entry PATH
+        // (and the ESM linker runtime) instead of pre-reading a single classic source.
+        let isModuleWorker = background.isModule && background.serviceWorker != nil
+        var source = ""
+        var moduleEntries: [String] = []
+        if let serviceWorker = background.serviceWorker {
+            if isModuleWorker {
+                moduleEntries = [serviceWorker]
+                // Confirm the entry exists up front so a typo'd manifest fails fast rather than at link.
+                guard await store.text(extensionID: ext.id, path: serviceWorker) != nil else {
+                    logBootFailure(ext, "background module service worker not found: \(serviceWorker)")
+                    return
+                }
+            } else {
+                source = await store.text(extensionID: ext.id, path: serviceWorker) ?? ""
+            }
+        } else if let page = background.page, !page.isEmpty {
+            // MV2 background PAGE (uBlock Origin's background.html): the page's <script> tags ARE the
+            // background, in document order. Classic scripts concatenate into the prelude source; a
+            // `type="module"` script becomes the ESM-linker entry (evaluated AFTER the classic prelude —
+            // exactly the order the page's HTML parser would give a deferred module). DOM bits the page
+            // would provide are covered by the worker shim's MV2 document emulation.
+            guard let html = await store.text(extensionID: ext.id, path: page) else {
+                logBootFailure(ext, "background page not found: \(page)")
+                return
+            }
+            let scripts = Self.scriptTags(inBackgroundPage: html, pagePath: page)
+            for tag in scripts {
+                if tag.isModule {
+                    // Link EVERY module script in document order (Sidebery's background.html has a locale
+                    // dict module before its real background.js; only linking the first ran the dict and
+                    // left the actual background dead, so the sidebar could never connect to it).
+                    moduleEntries.append(tag.path)
+                } else if let text = await store.text(extensionID: ext.id, path: tag.path) {
+                    source += text + "\n;\n"
+                } else {
+                    logBootFailure(ext, "background page script not found: \(tag.path)")
+                }
+            }
+        } else {
+            for path in background.scripts {
+                if let text = await store.text(extensionID: ext.id, path: path) { source += text + "\n;\n" }
+            }
+        }
+        // A declared background that resolves to no source never boots — the extension's whole chrome.*
+        // surface is dead. Previously a SILENT return; now logged so "extension X never started" is visible.
+        guard isModuleWorker || !moduleEntries.isEmpty || !source.isEmpty else {
+            let what = background.serviceWorker ?? background.page ?? background.scripts.joined(separator: ", ")
+            logBootFailure(ext, "background source missing/empty: \(what)")
+            return
+        }
+
+        let loaded = await loadMessages(ext, manifest: manifest)
+        let logStore = self.logStore
+        let context = WebExtensionBackgroundContext(
+            extensionID: ext.id,
+            extensionName: ext.displayName,
+            storage: storage,
+            logSink: { entry in
+                // Same gate as logFromPage: the background worker's `[bb-bg]` port/dispatch/storage trace is
+                // `.debug` and floods the Logs tab; suppress it unless verbose logging is opted in.
+                guard WebExtensionRuntime.verboseExtLogs || entry.level != .debug else { return }
+                Task { await logStore.append(entry) }
+            })
+
+        // Defense in depth against reentrancy: we released the MainActor at the awaits above, so a
+        // concurrent pass may already have booted this extension. Re-check with NO await before the
+        // assignment (atomic on the MainActor) and discard the loser so its timers/continuations are
+        // torn down rather than orphaned.
+        guard contexts[ext.id] == nil else {
+            context.shutdown()
+            return
+        }
+        context.host = host   // chrome.tabs bridge (may be nil until the browser VC loads)
+        context.cookieHost = cookieHost   // chrome.cookies bridge (same lifecycle as host)
+        // Cache this worker's granted permissions for the synchronous webNavigation event gate.
+        let granted = Set(manifest.permissions)
+        permissionsByExtension[ext.id] = granted
+        context.setGrantedPermissions(granted)
+        contexts[ext.id] = context
+        // Synchronous, path-contained package reader for the ESM linker (the store actor's
+        // `nonisolated fileSync` is safe to call off-actor on the worker's serial queue).
+        let moduleSource: (@Sendable (String) -> Data?)?
+        if !moduleEntries.isEmpty {
+            let storeRef = store
+            let extID = ext.id
+            moduleSource = { path in storeRef.fileSync(extensionID: extID, path: path) }
+        } else {
+            moduleSource = nil
+        }
+        let install = Self.consumeInstallReason(ext.id, currentVersion: manifest.version)
+        context.boot(runtimeJS: Self.backgroundRuntimeJS,
+                     backgroundSource: source,
+                     manifestJSON: ext.manifestJSON,
+                     baseURL: ext.baseURLString,
+                     messages: loaded.messages,
+                     placeholders: loaded.placeholders,
+                     installReason: install.reason,
+                     previousVersion: install.previousVersion,
+                     moduleEntries: moduleEntries,
+                     esmRuntimeJS: !moduleEntries.isEmpty ? Self.esmRuntimeJS : nil,
+                     moduleSource: moduleSource)
+    }
+
+    /// A background page's `<script>` tags, in document order: package path + whether `type="module"`.
+    /// Tolerant tag-level extraction (attribute order varies between builds); `src` resolves against the
+    /// page's directory (root-relative `/x` stands alone), matching how the HTML would load. Inline
+    /// scripts (no src) are skipped — Chrome extension pages under default CSP can't run them anyway.
+    /// Pure — unit-tested (nonisolated: no actor state touched, callable from sync test code).
+    nonisolated static func scriptTags(inBackgroundPage html: String, pagePath: String) -> [(path: String, isModule: Bool)] {
+        var results: [(path: String, isModule: Bool)] = []
+        guard let tagRegex = try? NSRegularExpression(pattern: "<script\\b[^>]*>", options: [.caseInsensitive]),
+              let srcRegex = try? NSRegularExpression(pattern: "src\\s*=\\s*[\"']([^\"']+)[\"']", options: [.caseInsensitive]),
+              let moduleRegex = try? NSRegularExpression(pattern: "type\\s*=\\s*[\"']module[\"']", options: [.caseInsensitive])
+        else { return results }
+        let dir = (pagePath as NSString).deletingLastPathComponent
+        tagRegex.enumerateMatches(in: html, range: NSRange(html.startIndex..., in: html)) { match, _, _ in
+            guard let match, let tagRange = Range(match.range, in: html) else { return }
+            let tag = String(html[tagRange])
+            let tagNSRange = NSRange(tag.startIndex..., in: tag)
+            guard let srcMatch = srcRegex.firstMatch(in: tag, range: tagNSRange),
+                  let srcRange = Range(srcMatch.range(at: 1), in: tag) else { return }
+            var src = String(tag[srcRange])
+            if src.hasPrefix("/") { src.removeFirst() }
+            else if !dir.isEmpty { src = dir + "/" + src }
+            let isModule = moduleRegex.firstMatch(in: tag, range: tagNSRange) != nil
+            results.append((src, isModule))
+        }
+        return results
+    }
+
+    /// The chrome.runtime.onInstalled detail for this boot, by comparing the stored last-booted version
+    /// against the manifest's current version — exactly like Chrome:
+    /// - first-ever boot of this id → `reason: "install"`, no previousVersion;
+    /// - a later boot whose version differs from the stored one → `reason: "update"`, previousVersion;
+    /// - same version already booted → no event (`nil`), so first-run setup doesn't re-run every launch.
+    /// onStartup still fires on every boot (handled in boot()). The legacy `installedFired` flag is
+    /// honored so extensions installed under the pre-version scheme don't spuriously re-fire `install`.
+    static func consumeInstallReason(_ extensionID: String,
+                                     currentVersion: String) -> (reason: String?, previousVersion: String?) {
+        let versionKey = "brownbear.webext.installedVersion.\(extensionID)"
+        let legacyKey = "brownbear.webext.installedFired.\(extensionID)"
+        let defaults = UserDefaults.standard
+        if let stored = defaults.string(forKey: versionKey) {
+            guard stored != currentVersion else { return (nil, nil) }
+            defaults.set(currentVersion, forKey: versionKey)
+            return ("update", stored)
+        }
+        // No version recorded yet for this id.
+        defaults.set(currentVersion, forKey: versionKey)
+        if defaults.bool(forKey: legacyKey) { return (nil, nil) }   // already installed pre-versioning
+        defaults.set(true, forKey: legacyKey)
+        return ("install", nil)
+    }
+
+    // MARK: - storage.onChanged fan-out
+
+    private func handleStorageChange(_ note: Notification) {
+        guard let info = note.userInfo,
+              let extensionID = info["extensionID"] as? String,
+              let area = info["area"] as? String,
+              let changes = info["changes"] as? [String: [String: String]],
+              let context = contexts[extensionID] else { return }
+        context.dispatchStorageChanged(area: area, changes: changes)
+    }
+
+    /// Fan a cookie change (one record) out to every background worker's chrome.cookies.onChanged.
+    /// iOS has a single cookie store, so the change is global; a worker without the cookies permission
+    /// simply has no listeners, so broadcasting to all is safe.
+    private func handleCookieChange(_ note: Notification) {
+        guard let change = note.userInfo?["change"] as? [String: Any] else { return }
+        for context in contexts.values { context.dispatchCookieChanged(change: change) }
+    }
+
+    /// Fire chrome.permissions.onAdded / onRemoved into an extension's background worker AND its open
+    /// pages after a runtime grant/revoke, matching Chrome's per-extension event fan-out. The `added`
+    /// and `removed` deltas are the `{permissions, origins}` objects the grants actor diffed; an empty
+    /// delta fires nothing.
+    private func handlePermissionsChange(_ note: Notification) {
+        guard let info = note.userInfo, let extensionID = info["extensionID"] as? String else { return }
+        if let added = info["added"] as? [String: Any] {
+            firePermissionEvent(extensionID: extensionID, name: "permissions.onAdded", delta: added)
+        }
+        if let removed = info["removed"] as? [String: Any] {
+            firePermissionEvent(extensionID: extensionID, name: "permissions.onRemoved", delta: removed)
+        }
+    }
+
+    /// Dispatch one chrome.permissions.on{Added,Removed} to the extension's worker + its open pages.
+    /// Scoped to the one extension whose permissions changed (a grant is never broadcast cross-extension).
+    private func firePermissionEvent(extensionID: String, name: String, delta: [String: Any]) {
+        let permissions = (delta["permissions"] as? [String]) ?? []
+        let origins = (delta["origins"] as? [String]) ?? []
+        guard !permissions.isEmpty || !origins.isEmpty,
+              let data = try? JSONSerialization.data(withJSONObject: [delta]),
+              let argsJSON = String(data: data, encoding: .utf8) else { return }
+        contexts[extensionID]?.dispatchExtEvent(name: name, argsJSON: argsJSON)
+        for box in eventReceivers.values {
+            guard let receiver = box.value, receiver.receiverExtensionID == extensionID else { continue }
+            receiver.dispatchExtEvent(name: name, argsJSON: argsJSON)
+        }
+    }
+
+    /// Deliver a chrome.notifications event to the originating extension's background worker.
+    private func handleNotificationEvent(_ note: Notification) {
+        guard let info = note.userInfo,
+              let extensionID = info["extensionID"] as? String,
+              let kind = info["kind"] as? String,
+              let notificationID = info["notificationID"] as? String,
+              let context = contexts[extensionID] else { return }
+        context.dispatchNotificationEvent(kind: kind,
+                                          notificationID: notificationID,
+                                          byUser: (info["byUser"] as? Bool) ?? false,
+                                          buttonIndex: (info["buttonIndex"] as? Int) ?? 0)
+    }
+
+    // MARK: - i18n messages
+
+    private func loadMessages(_ ext: WebExtension, manifest: WebExtensionManifest)
+        async -> (messages: [String: String], placeholders: [String: [String: String]]) {
+        guard let locale = manifest.defaultLocale,
+              let data = await store.file(extensionID: ext.id, path: "_locales/\(locale)/messages.json"),
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return ([:], [:])
+        }
+        var out: [String: String] = [:]
+        for (key, value) in json {
+            if let entry = value as? [String: Any], let message = entry["message"] as? String {
+                out[key] = message
+            }
+        }
+        return (out, WebExtensionLocalizer.extractPlaceholders(fromMessagesJSON: json))
+    }
+
+    // MARK: - Ports (background-side delivery)
+
+    /// Relay port traffic the worker initiates or replies to — the worker side of a port is its
+    /// JSContext, which only this runtime can touch. Called by the port hub on the main actor; the
+    /// context hops to its own serial queue. A port to an extension with no running worker drops
+    /// (nothing could have connected to it), matching Chrome's "no listener" outcome.
+    func deliverPortConnectToWorker(extensionID: String, portId: String, name: String, senderJSON: String) {
+        contexts[extensionID]?.dispatchPortConnect(portId: portId, name: name, senderJSON: senderJSON)
+    }
+
+    func deliverPortMessageToWorker(extensionID: String, portId: String, messageJSON: String) {
+        contexts[extensionID]?.dispatchPortMessage(portId: portId, messageJSON: messageJSON)
+    }
+
+    func deliverPortDisconnectToWorker(extensionID: String, portId: String) {
+        contexts[extensionID]?.dispatchPortDisconnect(portId: portId)
+    }
+
+    // MARK: - Runtime source
+
+    /// The chrome.* background runtime JS, loaded once from the bundle.
+    private static let backgroundRuntimeJS: String = {
+        guard let url = Bundle.main.url(forResource: "brownbear-webext-background", withExtension: "js", subdirectory: nil)
+                ?? Bundle.main.url(forResource: "brownbear-webext-background", withExtension: "js", subdirectory: "JS"),
+              let source = try? String(contentsOf: url, encoding: .utf8) else {
+            return "/* brownbear-webext-background.js missing */"
+        }
+        return source
+    }()
+
+    /// The ES-module linker runtime (acorn parser + brownbear-esm-linker), concatenated and loaded
+    /// once, lazily — only an extension with a module service worker pays the ~110 KB acorn parse.
+    /// acorn must precede the linker (the linker captures `globalThis.__bbAcorn` at load).
+    private static let esmRuntimeJS: String = {
+        let acorn = bundledJS("brownbear-acorn")
+        let linker = bundledJS("brownbear-esm-linker")
+        return acorn + "\n;\n" + linker
+    }()
+
+    private static func bundledJS(_ name: String) -> String {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "js", subdirectory: nil)
+                ?? Bundle.main.url(forResource: name, withExtension: "js", subdirectory: "JS"),
+              let source = try? String(contentsOf: url, encoding: .utf8) else {
+            return "/* \(name).js missing */"
+        }
+        return source
+    }
+}
+
+// MARK: - WebExtensionPortBackgroundDeliverer
+//
+// The port hub never imports JavaScriptCore; it asks the runtime to deliver background-side port
+// callbacks, and the runtime forwards to the extension's worker context (which owns the JSContext).
+extension WebExtensionRuntime: WebExtensionPortBackgroundDeliverer {
+    func deliverPortConnect(extensionID: String, portId: String, name: String, senderJSON: String) {
+        deliverPortConnectToWorker(extensionID: extensionID, portId: portId, name: name, senderJSON: senderJSON)
+    }
+
+    func deliverPortMessage(extensionID: String, portId: String, messageJSON: String) {
+        deliverPortMessageToWorker(extensionID: extensionID, portId: portId, messageJSON: messageJSON)
+    }
+
+    func deliverPortDisconnect(extensionID: String, portId: String) {
+        deliverPortDisconnectToWorker(extensionID: extensionID, portId: portId)
+    }
+}

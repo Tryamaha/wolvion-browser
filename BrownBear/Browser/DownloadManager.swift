@@ -1,0 +1,207 @@
+//
+//  DownloadManager.swift
+//  BrownBear
+//
+//  Owns file downloads via WKDownloadDelegate — the modern (iOS 14.5+) download API. When the
+//  browser decides a navigation response is a file WebKit can't render (a PDF/zip/dmg), it converts
+//  it to a WKDownload and hands it here. We pick a destination under Documents/Downloads, observe
+//  progress, and publish the list to the Downloads UI.
+//
+//  Not an actor / not @MainActor: WKDownloadDelegate callbacks arrive on the main thread, so the
+//  @Published mutations already happen on main. Progress KVO can fire off-main, so those hops are
+//  dispatched to main explicitly. A shared instance is set as the delegate for every download.
+//
+
+import Foundation
+import WebKit
+
+final class DownloadManager: NSObject, ObservableObject {
+
+    static let shared = DownloadManager()
+
+    /// Newest first. Drives the Downloads list.
+    @Published private(set) var downloads: [DownloadItem] = []
+
+    /// Maps a live WKDownload to the item it's filling, so finish/fail/progress find their row.
+    private var idsByDownload: [ObjectIdentifier: UUID] = [:]
+    private var progressObservations: [UUID: NSKeyValueObservation] = [:]
+
+    /// Called (on the main thread) after the user confirms and a download actually begins, so the
+    /// browser chrome can surface a "downloading…" affordance. Set by the browser controller.
+    var onDownloadStarted: (() -> Void)?
+
+    private override init() { super.init() }
+
+    /// Attach as the download's delegate. Called from the browser controller when WebKit converts a
+    /// navigation into a download. The item itself is created in `decideDestinationUsing` once the
+    /// suggested filename is known.
+    func begin(_ download: WKDownload) {
+        download.delegate = self
+    }
+
+    // MARK: - Destination
+
+    /// The app's Documents/Downloads directory, created on demand.
+    private func downloadsDirectory() -> URL {
+        let base = (try? FileManager.default.url(for: .documentDirectory, in: .userDomainMask,
+                                                 appropriateFor: nil, create: true))
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = base.appendingPathComponent("Downloads", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// A non-colliding destination: "file.pdf", then "file (1).pdf", "file (2).pdf", …
+    private func uniqueDestination(in dir: URL, fileName: String) -> URL {
+        let safeName = fileName.isEmpty ? "download" : fileName
+        var candidate = dir.appendingPathComponent(safeName)
+        guard FileManager.default.fileExists(atPath: candidate.path) else { return candidate }
+        let ext = candidate.pathExtension
+        let stem = candidate.deletingPathExtension().lastPathComponent
+        var index = 1
+        repeat {
+            let name = ext.isEmpty ? "\(stem) (\(index))" : "\(stem) (\(index)).\(ext)"
+            candidate = dir.appendingPathComponent(name)
+            index += 1
+        } while FileManager.default.fileExists(atPath: candidate.path)
+        return candidate
+    }
+
+    // MARK: - Mutations (main thread)
+
+    func remove(id: UUID) {
+        progressObservations[id]?.invalidate()
+        progressObservations[id] = nil
+        if let item = downloads.first(where: { $0.id == id }) {
+            try? FileManager.default.removeItem(at: item.localURL)
+        }
+        downloads.removeAll { $0.id == id }
+        idsByDownload = idsByDownload.filter { $0.value != id }
+    }
+
+    func clearFinished() {
+        for item in downloads where item.isFinished { progressObservations[item.id]?.invalidate() }
+        let finishedIDs = Set(downloads.filter(\.isFinished).map(\.id))
+        downloads.removeAll { $0.isFinished }
+        idsByDownload = idsByDownload.filter { !finishedIDs.contains($0.value) }
+    }
+
+    /// Register a file BrownBear already fetched (GM_download) into the Downloads list and write it to
+    /// the app's Downloads directory under a non-colliding name. Returns the on-disk URL, or nil if
+    /// the bytes couldn't be written. Marked finished immediately (the bytes are already in hand).
+    @discardableResult
+    func registerLocalDownload(data: Data, suggestedName: String) -> URL? {
+        let destination = uniqueDestination(in: downloadsDirectory(), fileName: suggestedName)
+        do {
+            try data.write(to: destination, options: .atomic)
+        } catch {
+            return nil
+        }
+        let item = DownloadItem(fileName: destination.lastPathComponent,
+                                localURL: destination,
+                                state: .finished,
+                                fractionCompleted: 1)
+        downloads.insert(item, at: 0)
+        onDownloadStarted?()
+        return destination
+    }
+
+    private func updateState(for download: WKDownload, _ apply: (inout DownloadItem) -> Void) {
+        guard let id = idsByDownload[ObjectIdentifier(download)],
+              let index = downloads.firstIndex(where: { $0.id == id }) else { return }
+        apply(&downloads[index])
+    }
+
+    // MARK: - Extension-initiated downloads (chrome.downloads)
+
+    /// A unique destination in the app's Downloads directory for an extension download with the given
+    /// suggested name (e.g. "file.pdf" → "file.pdf", then "file (1).pdf"). The bytes are written by the
+    /// chrome.downloads bridge's own URLSession task; this only reserves the path.
+    func extensionDownloadDestination(suggestedName: String) -> URL {
+        uniqueDestination(in: downloadsDirectory(), fileName: suggestedName)
+    }
+
+    /// Surface an extension-initiated download in the Downloads list (chrome.downloads.download). The
+    /// bridge owns the URLSession task and drives state via updateExtensionDownload.
+    func insertExtensionDownload(_ item: DownloadItem) {
+        downloads.insert(item, at: 0)
+        onDownloadStarted?()
+    }
+
+    /// Update an extension download's UI row by id (progress / finished / failed). No-op if absent.
+    func updateExtensionDownload(id: UUID, _ apply: (inout DownloadItem) -> Void) {
+        guard let index = downloads.firstIndex(where: { $0.id == id }) else { return }
+        apply(&downloads[index])
+    }
+}
+
+// MARK: - WKDownloadDelegate
+
+extension DownloadManager: WKDownloadDelegate {
+
+    func download(_ download: WKDownload,
+                  decideDestinationUsing response: URLResponse,
+                  suggestedFilename: String,
+                  completionHandler: @escaping (URL?) -> Void) {
+        let destination = uniqueDestination(in: downloadsDirectory(), fileName: suggestedFilename)
+        // Confirm before saving anything: this app runs untrusted pages, so a navigation turning
+        // into a file download is something the user must explicitly accept. Cancelling passes a nil
+        // destination, which tells WebKit to abort the download (nothing is written).
+        let host = response.url?.host.map { " from \($0)" } ?? ""
+        var size = ""
+        if response.expectedContentLength > 0 {
+            size = "\n" + ByteCountFormatter.string(fromByteCount: response.expectedContentLength, countStyle: .file)
+        }
+        let alert = UIAlertController(
+            title: "Download File?",
+            message: "“\(destination.lastPathComponent)”\(host)\(size)",
+            preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Download", style: .default) { [weak self] _ in
+            self?.startDownload(download, to: destination, completionHandler: completionHandler)
+        })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+            completionHandler(nil)
+        })
+        TopViewControllerPresenter.present(alert)
+    }
+
+    /// Register the confirmed download, begin observing its byte progress, and hand WebKit the
+    /// destination so it starts writing.
+    private func startDownload(_ download: WKDownload,
+                               to destination: URL,
+                               completionHandler: @escaping (URL?) -> Void) {
+        let item = DownloadItem(fileName: destination.lastPathComponent, localURL: destination)
+        downloads.insert(item, at: 0)
+        idsByDownload[ObjectIdentifier(download)] = item.id
+        // KVO may fire off the main thread, so hop back for @Published.
+        progressObservations[item.id] = download.progress.observe(\.fractionCompleted) { [weak self] progress, _ in
+            let fraction = progress.fractionCompleted
+            DispatchQueue.main.async {
+                self?.updateState(for: download) { $0.fractionCompleted = fraction }
+            }
+        }
+        completionHandler(destination)
+        onDownloadStarted?()
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        updateState(for: download) {
+            $0.fractionCompleted = 1
+            $0.state = .finished
+        }
+        finishObserving(download)
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        updateState(for: download) { $0.state = .failed(error.localizedDescription) }
+        finishObserving(download)
+    }
+
+    private func finishObserving(_ download: WKDownload) {
+        if let id = idsByDownload[ObjectIdentifier(download)] {
+            progressObservations[id]?.invalidate()
+            progressObservations[id] = nil
+        }
+        idsByDownload[ObjectIdentifier(download)] = nil
+    }
+}

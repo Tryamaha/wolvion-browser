@@ -1,0 +1,21 @@
+# Code ownership — every PR is auto-assigned to the owners below.
+# Owners for BrownBear. Add teammates here as the project grows.
+
+# Default owner for everything
+*                       @DudeAint
+
+# Module owners (split out as the team grows)
+/BrownBear/Browser/     @DudeAint
+/BrownBear/ScriptEngine/ @DudeAint
+/BrownBear/Sandbox/     @DudeAint
+/BrownBear/Background/  @DudeAint
+/BrownBear/Storage/     @DudeAint
+/BrownBear/Dashboard/   @DudeAint
+/BrownBear/Editor/      @DudeAint
+
+# These define how the whole project is built — guard them.
+/CLAUDE.md              @DudeAint
+/AGENTS.md              @DudeAint
+/ARCHITECTURE.md        @DudeAint
+/.github/               @DudeAint
+/SECURITY.md            @DudeAint

@@ -1,0 +1,49 @@
+//
+//  BBWebKitBridge.h
+//  BrownBear
+//
+//  A minimal Objective-C shim over one WKWebView method. Calling
+//  `evaluateJavaScript(_:in:in:)` from Swift links the Swift WebKit overlay
+//  (libswiftWebKit.dylib), which Apple removed from the iOS 18 runtime — so an app deploying to
+//  iOS 16.4 aborts at launch with "Library not loaded: /usr/lib/swift/libswiftWebKit.dylib".
+//  Routing this one call through Objective-C uses WebKit.framework directly and drops the
+//  overlay dependency entirely, letting us keep the 16.4 deployment target.
+//
+
+#import <Foundation/Foundation.h>
+#import <WebKit/WebKit.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+/// Evaluate `script` in the given content world of `webView`'s main frame. Fire-and-forget.
+void BBEvaluateJavaScript(WKWebView *webView, NSString *script, WKContentWorld *world);
+
+/// Evaluate `script` in the given content world of a SPECIFIC frame (pass nil for the main frame).
+/// Used to push state — e.g. a GM value change — into the exact iframe a script runs in, so the
+/// same script's instances across frames and tabs stay in sync. Fire-and-forget.
+void BBEvaluateJavaScriptInFrame(WKWebView *webView, NSString *script,
+                                 WKFrameInfo *_Nullable frame, WKContentWorld *world);
+
+/// Evaluate `script` in the main frame and return its result (or error) via `completion`, called on
+/// the main thread. Used by Reader mode to pull the extracted-article object back from the page.
+/// Still routed through the Objective-C method, so no Swift WebKit overlay is linked.
+void BBEvaluateJavaScriptForResult(WKWebView *webView, NSString *script, WKContentWorld *world,
+                                   void (^_Nullable completion)(id _Nullable result,
+                                                                NSError *_Nullable error));
+
+/// Evaluate `script` in a SPECIFIC frame (nil = main frame) and return its result via `completion`,
+/// called on the main thread. Used by chrome.scripting.executeScript's frameIds/allFrames targeting,
+/// which must run code in the exact iframe a content script asked for and report per-frame results.
+void BBEvaluateJavaScriptInFrameForResult(WKWebView *webView, NSString *script,
+                                          WKFrameInfo *_Nullable frame, WKContentWorld *world,
+                                          void (^_Nullable completion)(id _Nullable result,
+                                                                       NSError *_Nullable error));
+
+/// Render the WHOLE page to PDF data via WKWebView's Objective-C createPDF method, returning it on the
+/// main thread. Routed through ObjC (not Swift's `createPDF { Result<Data,Error> }`) for the SAME reason
+/// as the eval shims: the Swift WebKit overlay it would link aborts a 16.4-deployment app at launch.
+/// Used by the full-page-screenshot action.
+void BBCreatePDF(WKWebView *webView, void (^_Nullable completion)(NSData *_Nullable data,
+                                                                 NSError *_Nullable error));
+
+NS_ASSUME_NONNULL_END

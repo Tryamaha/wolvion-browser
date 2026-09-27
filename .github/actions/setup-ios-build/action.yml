@@ -1,0 +1,53 @@
+name: "Setup iOS build"
+description: "Install XcodeGen (prebuilt binary), generate the project, and restore the SwiftPM cache."
+
+# A reusable composite action so every workflow (CI, nightly, release) shares one consistent setup.
+# The safe speedup: download XcodeGen's pinned prebuilt binary instead of `brew install xcodegen`
+# (brew updates its formula index + resolves a dependency tree first — minutes per macOS job).
+#
+# NOTE: we deliberately do NOT reuse compiled output across commits. An earlier attempt cached
+# DerivedData + restored source mtimes (git-restore-mtime) for "incremental" builds — it produced
+# STALE binaries (Xcode trusted the cached objects and skipped recompiling changed files, so the
+# nightly shipped without the latest fixes). Correctness beats speed: every build is clean. Only the
+# SwiftPM package CLONE (not build products) is cached, which is safe.
+
+inputs:
+  xcodegen-version:
+    description: "Pinned XcodeGen release whose prebuilt binary is downloaded."
+    default: "2.45.4"
+
+runs:
+  using: composite
+  steps:
+    - name: Show selected Xcode
+      shell: bash
+      run: xcodebuild -version
+
+    - name: Install XcodeGen (pinned prebuilt binary)
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors -o "${RUNNER_TEMP}/xcodegen.zip" \
+          "https://github.com/yonaskolb/XcodeGen/releases/download/${{ inputs.xcodegen-version }}/xcodegen.zip"
+        unzip -q -o "${RUNNER_TEMP}/xcodegen.zip" -d "${RUNNER_TEMP}"
+        chmod +x "${RUNNER_TEMP}/xcodegen/bin/xcodegen"
+        echo "${RUNNER_TEMP}/xcodegen/bin" >> "${GITHUB_PATH}"
+
+    - name: Generate Xcode project
+      shell: bash
+      run: xcodegen generate
+
+    - name: Restore SwiftPM cache
+      uses: actions/cache@v4
+      with:
+        path: .spm-cache
+        key: spm-${{ runner.os }}-${{ hashFiles('project.yml') }}
+        restore-keys: |
+          spm-${{ runner.os }}-
+
+    - name: Resolve Swift packages (into cached path)
+      shell: bash
+      run: |
+        xcodebuild -resolvePackageDependencies \
+          -project BrownBear.xcodeproj -scheme BrownBear \
+          -clonedSourcePackagesDirPath .spm-cache
